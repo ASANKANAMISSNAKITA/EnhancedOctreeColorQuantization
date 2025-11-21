@@ -1,89 +1,231 @@
-# ===============================================
-# 3D RGB Cube Visualization with Octree & Progress
-# ===============================================
+# ======================================================
+# Enhanced RGB Cube + K-Means Palette Generation System
+# (Based on Huang-style Stage 1 + Stage 2)
+# ======================================================
+
 from PIL import Image
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
-from tqdm import tqdm  # progress bar
+from tqdm import tqdm
 import random
+import math
+from collections import defaultdict
 
-# ---------- Octree Node ----------
-class OctreeNode:
-    def __init__(self):
-        self.child = [None] * 8
-        self.color_count = 0
-        self.color_sum = [0, 0, 0]
+# ----------------- PARAMETERS -----------------
 
-def get_bit(value, bit_index):
-    return (value >> bit_index) & 1
+IMAGE_PATH = "4.2.03.tiff"   # <-- your image
+K = 7                        # desired number of palette colors
+CUBE_BINS = 16               # RGB cube division per axis (e.g., 8, 16, 32)
+COUNT_THRESHOLD = 1          # minimum pixel count for a cube to be considered (Thr)
+SAMPLE_RATE = 0.1            # fraction of pixels used for K-means refinement
+MAX_ITER = 10                # max iterations for K-means palette refinement
 
-def store_color(color, root, num_levels):
-    if root is None:
-        root = OctreeNode()
-    temp = root
-    R, G, B = color
-    for i in reversed(range(8 - num_levels, 8)):
-        r_bit = get_bit(R, i)
-        g_bit = get_bit(G, i)
-        b_bit = get_bit(B, i)
-        index = (r_bit << 2) | (g_bit << 1) | b_bit
-        if temp.child[index] is None:
-            temp.child[index] = OctreeNode()
-        temp = temp.child[index]
-    temp.color_count += 1
-    temp.color_sum[0] += R
-    temp.color_sum[1] += G
-    temp.color_sum[2] += B
-    return root
+# ----------------- HELPER FUNCTIONS -----------------
 
-def get_all_colors(node):
-    if node is None:
-        return []
-    if node.color_count > 0:
-        avg_color = tuple(int(c / node.color_count) for c in node.color_sum)
-        return [avg_color]
-    palette = []
-    for child in node.child:
-        palette.extend(get_all_colors(child))
-    return palette
+def rgb_to_cube_index(r, g, b, bins):
+    """
+    Map an RGB color to a cube index in a bins x bins x bins grid.
+    """
+    # bins in [0, bins-1]
+    rb = (r * bins) // 256
+    gb = (g * bins) // 256
+    bb = (b * bins) // 256
+    return (rb, gb, bb)
 
-def get_palette(colors, n=7):
-    colors_sorted = sorted(colors, key=lambda c: sum(c), reverse=True)
-    return colors_sorted[:n]
+def squared_euclidean(c1, c2):
+    dr = c1[0] - c2[0]
+    dg = c1[1] - c2[1]
+    db = c1[2] - c2[2]
+    return dr*dr + dg*dg + db*db
 
-# ---------- MAIN ----------
-if __name__ == "__main__":
-    image_path = "Mona_Lisa.jpg"  # <-- your image
-    img = Image.open(image_path).convert("RGB")
+# ----------------- STAGE 1: INITIAL PALETTE (RGB CUBE) -----------------
+
+def build_rgb_cubes(img, bins, count_threshold, sample_rate):
+    """
+    Scan the image once:
+      - build RGB cube statistics (initc, initn)
+      - collect sampled pixels for later K-means refinement
+    """
     width, height = img.size
+    cube_stats = {}   # key: (rb,gb,bb), value: dict(count, sum_r, sum_g, sum_b)
+    sampled_pixels = []
 
-    num_levels = 8
-    root = None
+    print("Scanning image and building RGB cubes...")
 
-    print("Building octree...")
-
-    # ---------- Progress bar for inserting pixels ----------
     for y in tqdm(range(height), desc="Rows processed"):
         for x in range(width):
-            color = img.getpixel((x, y))
-            root = store_color(color, root, num_levels)
+            r, g, b = img.getpixel((x, y))
 
-    print("Octree built.")
+            # --- update cube stats ---
+            cube_idx = rgb_to_cube_index(r, g, b, bins)
+            if cube_idx not in cube_stats:
+                cube_stats[cube_idx] = {
+                    "count": 0,
+                    "sum_r": 0,
+                    "sum_g": 0,
+                    "sum_b": 0
+                }
+            cube_stats[cube_idx]["count"] += 1
+            cube_stats[cube_idx]["sum_r"] += r
+            cube_stats[cube_idx]["sum_g"] += g
+            cube_stats[cube_idx]["sum_b"] += b
 
-    # Extract colors
-    colors = get_all_colors(root)
-    print(f"Number of leaf colors: {len(colors)}")
+            # --- sample pixels for Stage 2 ---
+            if random.random() < SAMPLE_RATE:
+                sampled_pixels.append((r, g, b))
 
-    # ---------- Sample colors for fast plotting ----------
-    max_points = 5000
-    if len(colors) > max_points:
-        colors_sample = random.sample(colors, max_points)
+    # build initc(i), initn(i) from cubes that pass threshold
+    initc = []  # candidate colors
+    initn = []  # their frequencies
+
+    for stats in cube_stats.values():
+        if stats["count"] >= count_threshold:
+            c_count = stats["count"]
+            mean_r = stats["sum_r"] // c_count
+            mean_g = stats["sum_g"] // c_count
+            mean_b = stats["sum_b"] // c_count
+            initc.append((mean_r, mean_g, mean_b))
+            initn.append(c_count)
+
+    print(f"Number of candidate colors (initc): {len(initc)}")
+    print(f"Number of sampled pixels for Stage 2: {len(sampled_pixels)}")
+
+    return initc, initn, sampled_pixels
+
+def initial_palette_generation(initc, initn, K):
+    """
+    Stage 1 (Huang-style):
+    - Start with the most frequent candidate color.
+    - Iteratively add colors that maximize DistN(i) = Dist(i) * sqrt(initn(i)),
+      where Dist(i) is the distance to the nearest already-selected palette color.
+    """
+    N = len(initc)
+    if N == 0:
+        return []
+
+    K = min(K, N)
+
+    selected = [False] * N
+    palette = []
+
+    # Step 1: initial palette empty, Cno = 0
+    Cno = 0
+
+    # Step 2: choose the candidate with max initn(i)
+    j = max(range(N), key=lambda i: initn[i])
+    selected[j] = True
+    palette.append(initc[j])
+    Cno += 1
+
+    # Step 3 & 4: iteratively add colors until we have K colors
+    while Cno < K:
+        best_idx = None
+        best_score = -1.0
+
+        for i in range(N):
+            if selected[i]:
+                continue
+
+            # Dist(i): min squared distance to any color in current palette
+            dist_i = min(squared_euclidean(initc[i], p) for p in palette)
+            score = dist_i * math.sqrt(initn[i])  # DistN(i)
+
+            if score > best_score:
+                best_score = score
+                best_idx = i
+
+        if best_idx is None:
+            break  # no more candidates
+        selected[best_idx] = True
+        palette.append(initc[best_idx])
+        Cno += 1
+
+    print(f"Initial palette generated (Stage 1) with {len(palette)} colors.")
+    return palette
+
+# ----------------- STAGE 2: K-MEANS PALETTE REFINEMENT -----------------
+
+def refine_palette_kmeans(sampled_pixels, initial_palette, max_iter=10):
+    """
+    Stage 2 (simplified fast K-means idea):
+    - Use sampled pixels and initial palette as starting centroids.
+    - Reassign pixels to nearest palette color.
+    - Recompute means as new palette colors.
+    - Stop when MSE stops improving or max_iter is reached.
+    """
+    if not sampled_pixels:
+        print("No sampled pixels, skipping Stage 2 refinement.")
+        return initial_palette
+
+    palette = [list(c) for c in initial_palette]
+    K = len(palette)
+
+    prev_mse = None
+
+    for it in range(max_iter):
+        # assignment step
+        clusters = [[] for _ in range(K)]
+        mse_accum = 0.0
+
+        for (r, g, b) in sampled_pixels:
+            dists = [squared_euclidean((r, g, b), (p[0], p[1], p[2])) for p in palette]
+            k = min(range(K), key=lambda idx: dists[idx])
+            clusters[k].append((r, g, b))
+            mse_accum += dists[k]
+
+        mse = mse_accum / len(sampled_pixels)
+
+        print(f"Iteration {it}: MSE = {mse:.2f}")
+
+        # stopping condition like Huang: if MSE doesn't improve, stop
+        if prev_mse is not None and mse >= prev_mse:
+            print("MSE did not improve, stopping refinement.")
+            break
+        prev_mse = mse
+
+        # update step: recompute palette colors
+        for k in range(K):
+            if clusters[k]:
+                sr = sum(p[0] for p in clusters[k]) / len(clusters[k])
+                sg = sum(p[1] for p in clusters[k]) / len(clusters[k])
+                sb = sum(p[2] for p in clusters[k]) / len(clusters[k])
+                palette[k] = [int(sr), int(sg), int(sb)]
+            # if cluster is empty, keep old color
+
+    refined_palette = [tuple(c) for c in palette]
+    print("Final palette generated (Stage 2 refinement).")
+    return refined_palette
+
+# ----------------- VISUALIZATION HELPERS -----------------
+
+def show_palette_swatch(palette, swatch_size=50):
+    """
+    Display a simple horizontal palette swatch image.
+    """
+    if not palette:
+        print("No palette to display.")
+        return
+
+    palette_img = Image.new("RGB", (swatch_size * len(palette), swatch_size))
+    for i, color in enumerate(palette):
+        for x in range(i * swatch_size, (i + 1) * swatch_size):
+            for y in range(swatch_size):
+                palette_img.putpixel((x, y), color)
+
+    print("Showing palette swatch...")
+    palette_img.show()
+
+def plot_rgb_cube(sampled_pixels, palette, max_points=500):
+    """
+    Plot sampled pixels in RGB cube and highlight palette colors as 'X'.
+    """
+    print("Plotting RGB cube with palette colors...")
+
+    if len(sampled_pixels) > max_points:
+        plot_points = random.sample(sampled_pixels, max_points)
     else:
-        colors_sample = colors
+        plot_points = sampled_pixels
 
-    palette = get_palette(colors, n=7)
-
-    # ---------- Plot 3D RGB Cube ----------
     fig = plt.figure(figsize=(10, 10))
     ax = fig.add_subplot(111, projection='3d')
     ax.set_xlabel('Red')
@@ -92,17 +234,46 @@ if __name__ == "__main__":
     ax.set_xlim(0, 255)
     ax.set_ylim(0, 255)
     ax.set_zlim(0, 255)
-    ax.set_title('RGB Cube - Color Distribution')
+    ax.set_title('RGB Cube - Sampled Colors and Palette')
 
-    # Plot sampled colors
-    for color in colors_sample:
-        r, g, b = color
+    # plot sampled pixels
+    for (r, g, b) in plot_points:
         ax.scatter(r, g, b, color=(r/255, g/255, b/255), s=5)
 
-    # Highlight palette colors
+    # highlight palette colors
     for color in palette:
         r, g, b = color
-        ax.scatter(r, g, b, color=(r/255, g/255, b/255), s=50, marker='X', edgecolors='black')
+        ax.scatter(r, g, b, color=(r/255, g/255, b/255),
+                   s=80, marker='X', edgecolors='black', linewidths=1.5)
 
-    print("Plotting complete. Palette colors are marked as 'X'.")
     plt.show()
+    print("Plotting complete. Palette colors are marked as 'X'.")
+
+# ----------------- MAIN -----------------
+
+if __name__ == "__main__":
+    # load image
+    img = Image.open(IMAGE_PATH).convert("RGB")
+
+    # Stage 1: build RGB cubes and generate initial palette
+    initc, initn, sampled_pixels = build_rgb_cubes(
+        img,
+        bins=CUBE_BINS,
+        count_threshold=COUNT_THRESHOLD,
+        sample_rate=SAMPLE_RATE
+    )
+
+    initial_palette = initial_palette_generation(initc, initn, K=K)
+
+    # Stage 2: refine palette with K-means on sampled pixels
+    final_palette = refine_palette_kmeans(
+        sampled_pixels,
+        initial_palette,
+        max_iter=MAX_ITER
+    )
+
+    # show palette as swatch
+    show_palette_swatch(final_palette)
+
+    # show RGB cube with palette points
+    plot_rgb_cube(sampled_pixels, final_palette)
