@@ -1,6 +1,6 @@
 # ======================================================
-# RGB Cube + K-Means Palette Generation System
-# (Existing Algorithm – Huang-style Stage 1 + Stage 2)
+# RGB Cube + Fast K-Means Palette Generation System
+# (Existing Algorithm based on Huang: Stage 1 + Stage 2)
 # ======================================================
 
 from PIL import Image
@@ -14,9 +14,9 @@ import math
 
 IMAGE_PATH = "4.2.03.tiff"   # <-- your image
 K = 7                        # desired number of palette colors
-CUBE_BINS = 16               # RGB cube division per axis (e.g., 8, 16, 32)
-COUNT_THRESHOLD = 1          # minimum pixel count for a cube to be considered (Thr)
-SAMPLE_RATE = 0.1            # fraction of pixels used for K-means refinement
+CUBE_BINS = 16               # RGB cube division per axis
+COUNT_THRESHOLD = 1          # Thr: minimum pixel count for a cube to be considered
+SAMPLE_RATE = 0.1            # fraction of pixels used for K-Means refinement
 MAX_ITER = 10                # Max_cycle in the paper
 
 # ----------------- HELPER FUNCTIONS -----------------
@@ -43,9 +43,8 @@ def squared_euclidean(c1, c2):
 
 def build_rgb_cubes(img, bins, count_threshold, sample_rate):
     """
-    Scan the image once:
-      - build RGB cube statistics (initc, initn)
-      - collect sampled pixels SCP_i for Stage 2
+    Build initc(i) and initn(i) using an RGB cube.
+    Also collect sampled pixels SCP_i for Stage 2.
     """
     width, height = img.size
     cube_stats = {}   # key: (rb,gb,bb), value: dict(count, sum_r, sum_g, sum_b)
@@ -71,7 +70,7 @@ def build_rgb_cubes(img, bins, count_threshold, sample_rate):
             cube_stats[cube_idx]["sum_g"] += g
             cube_stats[cube_idx]["sum_b"] += b
 
-            # --- sample pixels for Stage 2 (use parameter sample_rate) ---
+            # --- sample pixels for Stage 2 (SCP_i) ---
             if random.random() < sample_rate:
                 sampled_pixels.append((r, g, b))
 
@@ -95,10 +94,12 @@ def build_rgb_cubes(img, bins, count_threshold, sample_rate):
 
 def initial_palette_generation(initc, initn, K):
     """
-    Stage 1 (existing algorithm):
-    - Start with the most frequent candidate color.
-    - Iteratively add colors that maximize DistN(i) = Dist(i) * sqrt(initn(i)),
-      where Dist(i) is the distance to the nearest already-selected palette color.
+    Stage 1: Initial Palette Generation (existing algorithm)
+
+    Step 1: Selected(i) = 0, Cno = 0.
+    Step 2: choose initc(j) with max initn(j).
+    Step 3: DistN(i) = Dist(i) * sqrt(initn(i)) for unselected colors.
+    Step 4: repeat until Cno == K.
     """
     N = len(initc)
     if N == 0:
@@ -129,7 +130,8 @@ def initial_palette_generation(initc, initn, K):
 
             # Dist(i): min squared distance to any color in current palette
             dist_i = min(squared_euclidean(initc[i], p) for p in palette)
-            score = dist_i * math.sqrt(initn[i])  # DistN(i)
+            # DistN(i) = Dist(i) * (initn(i))^0.5
+            score = dist_i * math.sqrt(initn[i])
 
             if score > best_score:
                 best_score = score
@@ -137,6 +139,7 @@ def initial_palette_generation(initc, initn, K):
 
         if best_idx is None:
             break  # no more candidates
+
         selected[best_idx] = True
         palette.append(initc[best_idx])
         Cno += 1
@@ -144,17 +147,19 @@ def initial_palette_generation(initc, initn, K):
     print(f"Initial palette generated (Stage 1) with {len(palette)} colors.")
     return palette
 
-# ----------------- STAGE 2: K-MEANS PALETTE REFINEMENT -----------------
+# ----------------- STAGE 2: FAST K-MEANS PALETTE REFINEMENT -----------------
 
-def refine_palette_kmeans(sampled_pixels, initial_palette, max_iter=10):
+def fast_kmeans_palette_refinement(sampled_pixels, initial_palette, max_iter=10):
     """
-    Stage 2 (existing fast K-means idea):
-    - Use sampled pixels SCP_i and initial palette as starting centroids.
-    - Assign each SCP_i to its nearest palette color CCP_i.
-    - Recompute group means as new palette colors.
-    - Compute MSE1(Iter) = (1 / SPN) * sum SED(SCP_i, CCP_i).
-    - If Iter > 0 and MSE1(Iter) >= MSE1(Iter-1), set StopF = 1.
-    - Stop when Iter == Max_cycle or StopF == 1.
+    Stage 2: Fast K-Means Algorithm (existing algorithm)
+
+    Step 1: SCP_i sampling, Iter = 0, StopF = 0.
+    Step 2: assign each SCP_i to nearest palette color CCP_i.
+    Step 3: compute mean of K groups and sort palette by length.
+    Step 4: MSE1(Iter) = (1 / SPN) * sum_i SED(SCP_i, CCP_i).
+            If Iter > 0 and MSE1(Iter) >= MSE1(Iter - 1), StopF = 1.
+    Step 5: Iter = Iter + 1; if Iter == Max_cycle or StopF == 1, stop.
+    Step 6: output final palette and Iter.
     """
     if not sampled_pixels:
         print("No sampled pixels, skipping Stage 2 refinement.")
@@ -164,6 +169,7 @@ def refine_palette_kmeans(sampled_pixels, initial_palette, max_iter=10):
     K = len(palette)
     SPN = len(sampled_pixels)
 
+    # Step 1
     Iter = 0
     StopF = 0
     prev_mse = None
@@ -180,12 +186,12 @@ def refine_palette_kmeans(sampled_pixels, initial_palette, max_iter=10):
             mse_accum += dists[k_idx]  # SED(SCP_i, CCP_i)
 
         # Step 4: compute MSE1(Iter)
-        mse = mse_accum / SPN
-        print(f"Iteration {Iter}: MSE1({Iter}) = {mse:.2f}")
+        MSE1_iter = mse_accum / SPN
+        print(f"Iteration {Iter}: MSE1({Iter}) = {MSE1_iter:.2f}")
 
-        if Iter > 0 and mse >= prev_mse:
+        if Iter > 0 and MSE1_iter >= prev_mse:
             StopF = 1
-        prev_mse = mse
+        prev_mse = MSE1_iter
 
         # Step 3: update palette from group means
         for k in range(K):
@@ -275,8 +281,8 @@ if __name__ == "__main__":
 
     initial_palette = initial_palette_generation(initc, initn, K=K)
 
-    # Stage 2: refine palette with K-means on sampled pixels
-    final_palette = refine_palette_kmeans(
+    # Stage 2: refine palette with fast K-Means on sampled pixels
+    final_palette = fast_kmeans_palette_refinement(
         sampled_pixels,
         initial_palette,
         max_iter=MAX_ITER
