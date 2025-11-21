@@ -1,6 +1,6 @@
 # ======================================================
-# Enhanced RGB Cube + K-Means Palette Generation System
-# (Based on Huang-style Stage 1 + Stage 2)
+# RGB Cube + K-Means Palette Generation System
+# (Existing Algorithm – Huang-style Stage 1 + Stage 2)
 # ======================================================
 
 from PIL import Image
@@ -9,7 +9,6 @@ from mpl_toolkits.mplot3d import Axes3D
 from tqdm import tqdm
 import random
 import math
-from collections import defaultdict
 
 # ----------------- PARAMETERS -----------------
 
@@ -18,7 +17,7 @@ K = 7                        # desired number of palette colors
 CUBE_BINS = 16               # RGB cube division per axis (e.g., 8, 16, 32)
 COUNT_THRESHOLD = 1          # minimum pixel count for a cube to be considered (Thr)
 SAMPLE_RATE = 0.1            # fraction of pixels used for K-means refinement
-MAX_ITER = 10                # max iterations for K-means palette refinement
+MAX_ITER = 10                # Max_cycle in the paper
 
 # ----------------- HELPER FUNCTIONS -----------------
 
@@ -26,13 +25,15 @@ def rgb_to_cube_index(r, g, b, bins):
     """
     Map an RGB color to a cube index in a bins x bins x bins grid.
     """
-    # bins in [0, bins-1]
     rb = (r * bins) // 256
     gb = (g * bins) // 256
     bb = (b * bins) // 256
     return (rb, gb, bb)
 
 def squared_euclidean(c1, c2):
+    """
+    Squared Euclidean distance SED(c1, c2).
+    """
     dr = c1[0] - c2[0]
     dg = c1[1] - c2[1]
     db = c1[2] - c2[2]
@@ -44,7 +45,7 @@ def build_rgb_cubes(img, bins, count_threshold, sample_rate):
     """
     Scan the image once:
       - build RGB cube statistics (initc, initn)
-      - collect sampled pixels for later K-means refinement
+      - collect sampled pixels SCP_i for Stage 2
     """
     width, height = img.size
     cube_stats = {}   # key: (rb,gb,bb), value: dict(count, sum_r, sum_g, sum_b)
@@ -70,8 +71,8 @@ def build_rgb_cubes(img, bins, count_threshold, sample_rate):
             cube_stats[cube_idx]["sum_g"] += g
             cube_stats[cube_idx]["sum_b"] += b
 
-            # --- sample pixels for Stage 2 ---
-            if random.random() < SAMPLE_RATE:
+            # --- sample pixels for Stage 2 (use parameter sample_rate) ---
+            if random.random() < sample_rate:
                 sampled_pixels.append((r, g, b))
 
     # build initc(i), initn(i) from cubes that pass threshold
@@ -88,13 +89,13 @@ def build_rgb_cubes(img, bins, count_threshold, sample_rate):
             initn.append(c_count)
 
     print(f"Number of candidate colors (initc): {len(initc)}")
-    print(f"Number of sampled pixels for Stage 2: {len(sampled_pixels)}")
+    print(f"Number of sampled pixels for Stage 2 (SPN): {len(sampled_pixels)}")
 
     return initc, initn, sampled_pixels
 
 def initial_palette_generation(initc, initn, K):
     """
-    Stage 1 (Huang-style):
+    Stage 1 (existing algorithm):
     - Start with the most frequent candidate color.
     - Iteratively add colors that maximize DistN(i) = Dist(i) * sqrt(initn(i)),
       where Dist(i) is the distance to the nearest already-selected palette color.
@@ -147,11 +148,13 @@ def initial_palette_generation(initc, initn, K):
 
 def refine_palette_kmeans(sampled_pixels, initial_palette, max_iter=10):
     """
-    Stage 2 (simplified fast K-means idea):
-    - Use sampled pixels and initial palette as starting centroids.
-    - Reassign pixels to nearest palette color.
-    - Recompute means as new palette colors.
-    - Stop when MSE stops improving or max_iter is reached.
+    Stage 2 (existing fast K-means idea):
+    - Use sampled pixels SCP_i and initial palette as starting centroids.
+    - Assign each SCP_i to its nearest palette color CCP_i.
+    - Recompute group means as new palette colors.
+    - Compute MSE1(Iter) = (1 / SPN) * sum SED(SCP_i, CCP_i).
+    - If Iter > 0 and MSE1(Iter) >= MSE1(Iter-1), set StopF = 1.
+    - Stop when Iter == Max_cycle or StopF == 1.
     """
     if not sampled_pixels:
         print("No sampled pixels, skipping Stage 2 refinement.")
@@ -159,31 +162,32 @@ def refine_palette_kmeans(sampled_pixels, initial_palette, max_iter=10):
 
     palette = [list(c) for c in initial_palette]
     K = len(palette)
+    SPN = len(sampled_pixels)
 
+    Iter = 0
+    StopF = 0
     prev_mse = None
 
-    for it in range(max_iter):
-        # assignment step
+    while Iter < max_iter and not StopF:
+        # Step 2: assignment step
         clusters = [[] for _ in range(K)]
         mse_accum = 0.0
 
         for (r, g, b) in sampled_pixels:
             dists = [squared_euclidean((r, g, b), (p[0], p[1], p[2])) for p in palette]
-            k = min(range(K), key=lambda idx: dists[idx])
-            clusters[k].append((r, g, b))
-            mse_accum += dists[k]
+            k_idx = min(range(K), key=lambda idx: dists[idx])
+            clusters[k_idx].append((r, g, b))
+            mse_accum += dists[k_idx]  # SED(SCP_i, CCP_i)
 
-        mse = mse_accum / len(sampled_pixels)
+        # Step 4: compute MSE1(Iter)
+        mse = mse_accum / SPN
+        print(f"Iteration {Iter}: MSE1({Iter}) = {mse:.2f}")
 
-        print(f"Iteration {it}: MSE = {mse:.2f}")
-
-        # stopping condition like Huang: if MSE doesn't improve, stop
-        if prev_mse is not None and mse >= prev_mse:
-            print("MSE did not improve, stopping refinement.")
-            break
+        if Iter > 0 and mse >= prev_mse:
+            StopF = 1
         prev_mse = mse
 
-        # update step: recompute palette colors
+        # Step 3: update palette from group means
         for k in range(K):
             if clusters[k]:
                 sr = sum(p[0] for p in clusters[k]) / len(clusters[k])
@@ -192,8 +196,14 @@ def refine_palette_kmeans(sampled_pixels, initial_palette, max_iter=10):
                 palette[k] = [int(sr), int(sg), int(sb)]
             # if cluster is empty, keep old color
 
+        # sort K palette colors in ascending order of length
+        palette.sort(key=lambda c: c[0]**2 + c[1]**2 + c[2]**2)
+
+        # Step 5: Iter = Iter + 1
+        Iter += 1
+
     refined_palette = [tuple(c) for c in palette]
-    print("Final palette generated (Stage 2 refinement).")
+    print(f"Final palette generated (Stage 2) after {Iter} iterations.")
     return refined_palette
 
 # ----------------- VISUALIZATION HELPERS -----------------
