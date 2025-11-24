@@ -12,8 +12,8 @@ import math
 
 # ----------------- PARAMETERS -----------------
 
-IMAGE_PATH = "4.2.03.tiff"   # <-- your image
-K = 7                        # desired number of palette colors
+IMAGE_PATH = "flower.jpg"   # <-- your image
+K = 7                       # desired number of palette colors
 CUBE_BINS = 16               # RGB cube division per axis
 COUNT_THRESHOLD = 1          # Thr: minimum pixel count for a cube to be considered
 SAMPLE_RATE = 0.1            # fraction of pixels used for K-Means refinement
@@ -231,7 +231,7 @@ def show_palette_swatch(palette, swatch_size=50):
     print("Showing palette swatch...")
     palette_img.show()
 
-def plot_rgb_cube(sampled_pixels, palette, max_points=500):
+def plot_rgb_cube(sampled_pixels, palette, max_points=5000):
     """
     Plot sampled pixels in RGB cube and highlight palette colors as 'X'.
     """
