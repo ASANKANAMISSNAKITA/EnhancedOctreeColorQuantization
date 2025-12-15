@@ -1,150 +1,115 @@
-# ============================================================
-# SOP 2 Visualization (Using your own image)
-# Dominant vs Rare Color Bias in Palette Generation
-#
-# 2x2:
-# [ Original (with rare patch) ] [ Generated Palette ]
-# [ RGB Cube (pixels)          ] [ Explanation Text  ]
-# ============================================================
+# ==========================================================
+# SOP2 Baseline (No graph) – Original + Palette + BIG Runtime (+ Pixel Count)
+# ==========================================================
 
-from PIL import Image, ImageDraw
+from PIL import Image
 import numpy as np
 import matplotlib.pyplot as plt
-import random
-from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+import time
 
-# ---------------- PARAMETERS ----------------
-IMAGE_PATH = "starry.jpg"   # <-- put your image here
+IMAGE_PATH = "birdhouse.jpg"
 K = 8
 MAX_ITER = 10
-SEED = 1
-SAMPLE_POINTS = 5000
 
-# Rare accent patch (small but visually important)
-PATCH_SIZE = 0                         # <-- make smaller to be "rare"
-PATCH_COLOR = (0, 0, 0)             # <-- strong color
-PATCH_POS = "bottom_right"              # "top_left", "top_right", "bottom_left", "bottom_right"
 
-# ---------------- K-MEANS (RGB) ----------------
-def squared_euclidean(c1, c2):
-    dr = c1[0] - c2[0]
-    dg = c1[1] - c2[1]
-    db = c1[2] - c2[2]
-    return dr*dr + dg*dg + db*db
+def squared_euclidean_batch(pixels, centroids):
+    diff = pixels[:, None, :] - centroids[None, :, :]
+    return np.sum(diff * diff, axis=2)
 
-def kmeans_rgb(pixels, K, max_iter=10, seed=None):
-    if seed is not None:
-        random.seed(seed)
-
+def init_centroids_deterministic(pixels, K):
     N = len(pixels)
     K = min(K, N)
-    centroids = random.sample(pixels, K)
+    idx = np.linspace(0, N - 1, K, dtype=int)
+    return pixels[idx].copy()
 
-    for _ in range(max_iter):
-        clusters = [[] for _ in range(K)]
+def kmeans_rgb_numpy(pixels_u8, K, max_iter=10, early_stop=True):
+    pixels = pixels_u8.astype(np.float32)
+    N = pixels.shape[0]
 
-        for p in pixels:
-            idx = min(range(K), key=lambda i: squared_euclidean(p, centroids[i]))
-            clusters[idx].append(p)
+    centroids = init_centroids_deterministic(pixels, K)
+    mse_hist = []
+    prev_mse = None
 
-        for i in range(K):
-            if clusters[i]:
-                centroids[i] = tuple(
-                    int(sum(c[j] for c in clusters[i]) / len(clusters[i]))
-                    for j in range(3)
-                )
+    for it in range(max_iter):
+        d2 = squared_euclidean_batch(pixels, centroids)
+        labels = np.argmin(d2, axis=1)
+        min_d2 = d2[np.arange(N), labels]
+        mse = float(np.mean(min_d2))
+        mse_hist.append(mse)
 
-    return centroids
+        print(f"[BASE] Iter {it}: MSE_RGB = {mse:.2f}")
 
-# ---------------- PALETTE SWATCH ----------------
-def make_swatch(palette, h=60, w=50):
-    img = Image.new("RGB", (w * len(palette), h))
-    for i, c in enumerate(palette):
-        for x in range(i * w, (i + 1) * w):
-            for y in range(h):
+        if early_stop and prev_mse is not None and mse >= prev_mse:
+            print("[BASE] Early stop: MSE did not improve.")
+            break
+        prev_mse = mse
+
+        counts = np.bincount(labels, minlength=K).astype(np.float32)
+        new_centroids = centroids.copy()
+        for ch in range(3):
+            sums = np.bincount(labels, weights=pixels[:, ch], minlength=K).astype(np.float32)
+            mask = counts > 0
+            new_centroids[mask, ch] = sums[mask] / counts[mask]
+        centroids = new_centroids
+
+    return np.clip(centroids, 0, 255).astype(np.uint8), mse_hist
+
+def make_swatch_image(palette, swatch_h=90, w_per=70):
+    img = Image.new("RGB", (w_per * len(palette), swatch_h))
+    for i, c in enumerate([tuple(map(int, x)) for x in palette]):
+        for x in range(i * w_per, (i + 1) * w_per):
+            for y in range(swatch_h):
                 img.putpixel((x, y), c)
     return img
 
-# ---------------- RGB CUBE ----------------
-def plot_rgb_cube(ax, pixels, title):
-    pts = np.array(pixels, dtype=np.uint8)
-    if len(pts) > SAMPLE_POINTS:
-        idx = np.random.choice(len(pts), SAMPLE_POINTS, replace=False)
-        pts = pts[idx]
 
-    ax.scatter(pts[:, 0], pts[:, 1], pts[:, 2], c=pts/255.0, s=3, alpha=0.6)
-    ax.set_xlim(0, 255)
-    ax.set_ylim(0, 255)
-    ax.set_zlim(0, 255)
-    ax.set_xlabel("R")
-    ax.set_ylabel("G")
-    ax.set_zlabel("B")
-    ax.set_title(title)
-
-# ---------------- ADD RARE PATCH ----------------
-def add_rare_patch(img, patch_size, patch_color, pos="bottom_right"):
-    out = img.copy()
-    draw = ImageDraw.Draw(out)
-    w, h = out.size
-
-    if pos == "top_left":
-        x0, y0 = 10, 10
-    elif pos == "top_right":
-        x0, y0 = w - patch_size - 10, 10
-    elif pos == "bottom_left":
-        x0, y0 = 10, h - patch_size - 10
-    else:  # bottom_right
-        x0, y0 = w - patch_size - 10, h - patch_size - 10
-
-    draw.rectangle([x0, y0, x0 + patch_size, y0 + patch_size], fill=patch_color)
-
-    # optional border to make it obvious
-    draw.rectangle([x0, y0, x0 + patch_size, y0 + patch_size], outline=(0, 0, 0), width=2)
-
-    return out
-
-# ---------------- MAIN ----------------
 if __name__ == "__main__":
-    # Load your image
     orig = Image.open(IMAGE_PATH).convert("RGB")
+    ow, oh = orig.size
+    orig_np = np.asarray(orig, dtype=np.uint8)
+    total_pixels = ow * oh
 
-    # Add a small rare-color patch so we can test if palette captures it
-    test_img = add_rare_patch(orig, PATCH_SIZE, PATCH_COLOR, PATCH_POS)
+    print(f"Upload size: {ow}x{oh}  (pixels={total_pixels:,})")
 
-    pixels = list(test_img.getdata())
+    t0 = time.perf_counter()
+    palette, mse_hist = kmeans_rgb_numpy(orig_np.reshape(-1, 3), K, MAX_ITER, early_stop=True)
+    t1 = time.perf_counter()
 
-    # Generate palette from the test image
-    palette = kmeans_rgb(pixels, K, MAX_ITER, SEED)
-    swatch = make_swatch(palette)
+    runtime = t1 - t0
+    final_mse = mse_hist[-1]
 
-    # -------- 2x2 FIGURE --------
-    fig = plt.figure(figsize=(12, 8))
-    gs = fig.add_gridspec(2, 2, hspace=0.35, wspace=0.25)
+    print("\nFinal palette (RGB centroids):")
+    for i, c in enumerate(palette):
+        print(f"  c{i}: ({int(c[0])}, {int(c[1])}, {int(c[2])})")
 
-    ax1 = fig.add_subplot(gs[0, 0])
-    ax1.imshow(np.array(test_img))
-    ax1.set_title("Input Image (with rare accent patch)")
-    ax1.axis("off")
+    print(f"\nRuntime (baseline on full upload): {runtime:.2f} seconds")
+    print(f"Final MSE_RGB: {final_mse:.2f}")
 
-    ax2 = fig.add_subplot(gs[0, 1])
-    ax2.imshow(np.array(swatch))
-    ax2.set_title("Generated Palette (RGB K-Means)")
-    ax2.axis("off")
+    swatch = make_swatch_image(palette)
 
-    ax3 = fig.add_subplot(gs[1, 0], projection="3d")
-    plot_rgb_cube(ax3, pixels, "RGB Cube (Sampled Pixels)")
+    # -----------------------------
+    # 1x2 Figure (NO graph)
+    # -----------------------------
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+    fig.suptitle("SOP2 Baseline (Full-res)", fontsize=16)
 
-    ax4 = fig.add_subplot(gs[1, 1])
-    ax4.axis("off")
-    ax4.text(
-        0.05, 0.6,
-        "SOP 2 Observation:\n\n"
-        "• Dominant colors occupy most pixels\n"
-        "• The accent patch is visually important but rare\n"
-        "• K-Means centroids are pulled toward dominant regions\n"
-        "• Rare colors may be missing from the final palette",
-        fontsize=11
+    # ✅ BIG runtime showcase (now includes pixel count)
+    fig.text(
+        0.5, 0.91,
+        f"Runtime: {runtime:.2f}s   |   Final MSE: {final_mse:.2f}   |   Pixels: {total_pixels:,}   |   K={K}",
+        ha="center", va="center",
+        fontsize=18, fontweight="bold"
     )
 
-    plt.suptitle("SOP 2 Visual: Dominant vs Rare Color Bias in Palette Generation", fontsize=14)
+    # Original image (now includes pixel count in title too)
+    axes[0].imshow(orig)
+    axes[0].set_title(f"Original Upload ({ow}×{oh}px | {total_pixels:,} px)", fontsize=13)
+    axes[0].axis("off")
+
+    # Palette swatch
+    axes[1].imshow(np.asarray(swatch, dtype=np.uint8))
+    axes[1].set_title("Final palette swatch", fontsize=13)
+    axes[1].axis("off")
+
+    plt.tight_layout(rect=[0, 0, 1, 0.88])
     plt.show()

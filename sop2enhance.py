@@ -1,196 +1,156 @@
-# ============================================================
-# SOP 2 ENHANCED Visualization (Patch-based, robust)
-# Dominant vs Rare Color Bias in Palette Generation
+# ==========================================================
+# SOP2 (Proof + Enhancement) – High-res is slower, resizing fixes it
+# (NO QUANTIZED VISUALS) – Focus on Runtime, MSE, K + PIXEL COUNT
 #
-# 2x2:
-# [ Original (with rare patch) ] [ Generated Palette ]
-# [ RGB Cube (pixels)          ] [ Evidence + Explanation Text  ]
-# ============================================================
+# 1x3 Figure:
+# [ Original Upload ] [ Resized for Processing ] [ ENH Palette Swatch ]
+# ==========================================================
 
-from PIL import Image, ImageDraw
+from PIL import Image
 import numpy as np
 import matplotlib.pyplot as plt
-import random
-from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+import time
 
-# ---------------- PARAMETERS ----------------
-IMAGE_PATH = "starry.jpg"      # <-- put your image here
+IMAGE_PATH = "birdhouse.jpg"
 K = 8
 MAX_ITER = 10
-SEED = 1
-SAMPLE_POINTS = 1500           # keep light so it won't lag
+PROCESS_MAX = 512
+PLOT_MAX_SIDE = 900
 
-# Rare accent patch (small but visually important)
-PATCH_SIZE = 0                 # if 0, auto-set to ~2% of min(image_w, image_h)
-PATCH_COLOR = (0, 80, 255)     # strong blue (visible)
-PATCH_POS = "bottom_right"     # "top_left", "top_right", "bottom_left", "bottom_right"
 
-# Evidence settings
-NEAR_THRESH = 25               # "near" distance in RGB (15–40 works)
+def squared_euclidean_batch(pixels, centroids):
+    diff = pixels[:, None, :] - centroids[None, :, :]
+    return np.sum(diff * diff, axis=2)
 
-# ---------------- K-MEANS (RGB) ----------------
-def squared_euclidean(c1, c2):
-    dr = c1[0] - c2[0]
-    dg = c1[1] - c2[1]
-    db = c1[2] - c2[2]
-    return dr*dr + dg*dg + db*db
+def resize_to_max(img, max_side=512):
+    w, h = img.size
+    if max(w, h) <= max_side:
+        return img, False
+    scale = max_side / float(max(w, h))
+    new_w = int(round(w * scale))
+    new_h = int(round(h * scale))
+    return img.resize((new_w, new_h), Image.BILINEAR), True
 
-def kmeans_rgb(pixels, K, max_iter=10, seed=None):
-    if seed is not None:
-        random.seed(seed)
-
-    pixels = [tuple(map(int, p)) for p in pixels]
+def init_centroids_deterministic(pixels, K):
     N = len(pixels)
     K = min(K, N)
+    idx = np.linspace(0, N - 1, K, dtype=int)
+    return pixels[idx].copy()
 
-    centroids = random.sample(pixels, K)
+def kmeans_rgb_numpy(pixels_u8, K, max_iter=10, early_stop=True, tag="RGB"):
+    pixels = pixels_u8.astype(np.float32)
+    N = pixels.shape[0]
 
-    for _ in range(max_iter):
-        clusters = [[] for _ in range(K)]
+    centroids = init_centroids_deterministic(pixels, K)
+    mse_hist = []
+    prev_mse = None
 
-        for p in pixels:
-            idx = min(range(K), key=lambda i: squared_euclidean(p, centroids[i]))
-            clusters[idx].append(p)
+    for it in range(max_iter):
+        d2 = squared_euclidean_batch(pixels, centroids)
+        labels = np.argmin(d2, axis=1)
+        min_d2 = d2[np.arange(N), labels]
+        mse = float(np.mean(min_d2))
+        mse_hist.append(mse)
 
-        for i in range(K):
-            if clusters[i]:
-                arr = np.array(clusters[i], dtype=np.float32)
-                centroids[i] = tuple(np.mean(arr, axis=0).astype(np.int32))
+        print(f"[{tag}] Iter {it}: MSE_RGB = {mse:.2f}")
 
-    return centroids
+        if early_stop and prev_mse is not None and mse >= prev_mse:
+            print(f"[{tag}] Early stop: MSE did not improve.")
+            break
+        prev_mse = mse
 
-# ---------------- PALETTE SWATCH ----------------
-def make_swatch(palette, h=60, w=50):
-    img = Image.new("RGB", (w * len(palette), h))
-    for i, c in enumerate(palette):
-        c = tuple(map(int, c))
-        for x in range(i * w, (i + 1) * w):
-            for y in range(h):
+        counts = np.bincount(labels, minlength=K).astype(np.float32)
+        new_centroids = centroids.copy()
+
+        for ch in range(3):
+            sums = np.bincount(labels, weights=pixels[:, ch], minlength=K).astype(np.float32)
+            mask = counts > 0
+            new_centroids[mask, ch] = sums[mask] / counts[mask]
+
+        centroids = new_centroids
+
+    return np.clip(centroids, 0, 255).astype(np.uint8), mse_hist
+
+def make_swatch_image(palette, swatch_h=90, w_per=70):
+    img = Image.new("RGB", (w_per * len(palette), swatch_h))
+    for i, c in enumerate([tuple(map(int, x)) for x in palette]):
+        for x in range(i * w_per, (i + 1) * w_per):
+            for y in range(swatch_h):
                 img.putpixel((x, y), c)
     return img
 
-# ---------------- RGB CUBE ----------------
-def plot_rgb_cube(ax, pixels, title):
-    pts = np.array(pixels, dtype=np.uint8)
-    if len(pts) > SAMPLE_POINTS:
-        idx = np.random.choice(len(pts), SAMPLE_POINTS, replace=False)
-        pts = pts[idx]
+def plot_preview(img: Image.Image, max_side=PLOT_MAX_SIDE) -> Image.Image:
+    w, h = img.size
+    if max(w, h) <= max_side:
+        return img
+    scale = max_side / float(max(w, h))
+    return img.resize((int(w * scale), int(h * scale)), Image.BILINEAR)
 
-    ax.scatter(pts[:, 0], pts[:, 1], pts[:, 2], c=pts/255.0, s=3, alpha=0.6)
-    ax.set_xlim(0, 255)
-    ax.set_ylim(0, 255)
-    ax.set_zlim(0, 255)
-    ax.set_xlabel("R")
-    ax.set_ylabel("G")
-    ax.set_zlabel("B")
-    ax.set_title(title)
 
-# ---------------- ADD RARE PATCH ----------------
-def add_rare_patch(img, patch_size, patch_color, pos="bottom_right"):
-    out = img.copy()
-    draw = ImageDraw.Draw(out)
-    w, h = out.size
-
-    # auto patch size if user left it as 0
-    if patch_size is None or patch_size <= 0:
-        patch_size = max(6, int(0.02 * min(w, h)))  # ~2% of min dimension, at least 6px
-
-    if pos == "top_left":
-        x0, y0 = 10, 10
-    elif pos == "top_right":
-        x0, y0 = w - patch_size - 10, 10
-    elif pos == "bottom_left":
-        x0, y0 = 10, h - patch_size - 10
-    else:  # bottom_right
-        x0, y0 = w - patch_size - 10, h - patch_size - 10
-
-    # filled patch
-    draw.rectangle([x0, y0, x0 + patch_size, y0 + patch_size], fill=patch_color)
-    # border (high-contrast)
-    draw.rectangle([x0, y0, x0 + patch_size, y0 + patch_size], outline=(255, 255, 255), width=2)
-
-    return out, patch_size, (x0, y0, x0 + patch_size, y0 + patch_size)
-
-# ---------------- EVIDENCE CHECKS ----------------
-def percent_pixels_near_color(pixels_uint8, target_rgb, near_thresh):
-    px = pixels_uint8.astype(np.int32)
-    t = np.array(target_rgb, dtype=np.int32)
-    d2 = np.sum((px - t) ** 2, axis=1)
-    near = int(np.sum(d2 <= near_thresh * near_thresh))
-    total = int(px.shape[0])
-    return near, total, (near / total) * 100.0
-
-def palette_has_near_color(palette, target_rgb, near_thresh):
-    t = np.array(target_rgb, dtype=np.int32)
-    best = None
-    for c in palette:
-        c = np.array(c, dtype=np.int32)
-        d = np.sqrt(np.sum((c - t) ** 2))
-        if best is None or d < best:
-            best = d
-    return (best is not None and best <= near_thresh), best
-
-# ---------------- MAIN ----------------
 if __name__ == "__main__":
-    # Load image safely
-    try:
-        orig = Image.open(IMAGE_PATH).convert("RGB")
-    except FileNotFoundError:
-        raise SystemExit(f"ERROR: Cannot find file '{IMAGE_PATH}'. Put the image in the same folder or fix IMAGE_PATH.")
+    orig = Image.open(IMAGE_PATH).convert("RGB")
+    ow, oh = orig.size
+    orig_np = np.asarray(orig, dtype=np.uint8)
+    orig_pixels = ow * oh
 
-    # Add rare patch
-    test_img, final_patch_size, patch_box = add_rare_patch(orig, PATCH_SIZE, PATCH_COLOR, PATCH_POS)
+    print(f"\nUPLOAD: {ow}x{oh}  (pixels={orig_pixels:,})")
 
-    img_arr = np.array(test_img, dtype=np.uint8)
-    pixels = img_arr.reshape(-1, 3)
-    pixels_list = [tuple(p) for p in pixels]
+    # BASE runtime + MSE (proof)
+    print("\n=== BASELINE: K-Means on ORIGINAL upload (no resizing) ===")
+    t0 = time.perf_counter()
+    pal_base, mse_base = kmeans_rgb_numpy(orig_np.reshape(-1, 3), K, MAX_ITER, early_stop=True, tag="BASE")
+    t1 = time.perf_counter()
+    runtime_base = t1 - t0
+    final_mse_base = mse_base[-1]
 
-    # Generate palette
-    palette = kmeans_rgb(pixels_list, K, MAX_ITER, SEED)
-    swatch = make_swatch(palette)
+    # ENH runtime + MSE (enhancement)
+    print("\n=== ENHANCED: Resize to <=512 then K-Means ===")
+    proc_img, resized = resize_to_max(orig, PROCESS_MAX)
+    pw, ph = proc_img.size
+    proc_np = np.asarray(proc_img, dtype=np.uint8)
+    proc_pixels = pw * ph
 
-    # Evidence: how rare is the patch color?
-    near_count, total, near_pct = percent_pixels_near_color(pixels, PATCH_COLOR, NEAR_THRESH)
+    print(f"Processing cap: <= {PROCESS_MAX}px")
+    print(f"Resized to: {pw}x{ph}  (pixels={proc_pixels:,})  | reduction ~{orig_pixels/proc_pixels:.1f}×")
 
-    # Evidence: did palette capture it (or something near it)?
-    has_patch, best_d = palette_has_near_color(palette, PATCH_COLOR, NEAR_THRESH)
+    t2 = time.perf_counter()
+    pal_enh, mse_enh = kmeans_rgb_numpy(proc_np.reshape(-1, 3), K, MAX_ITER, early_stop=True, tag="ENH")
+    t3 = time.perf_counter()
+    runtime_enh = t3 - t2
+    final_mse_enh = mse_enh[-1]
 
-    # -------- 2x2 FIGURE --------
-    fig = plt.figure(figsize=(12, 8))
-    gs = fig.add_gridspec(2, 2, hspace=0.35, wspace=0.25)
+    speedup = runtime_base / max(runtime_enh, 1e-9)
+    print(f"\nSPEEDUP (BASE/ENH): ~{speedup:.1f}× faster with resizing")
 
-    # (1) Image
-    ax1 = fig.add_subplot(gs[0, 0])
-    ax1.imshow(img_arr)
-    ax1.set_title(f"Input Image (rare patch: {PATCH_COLOR}, size={final_patch_size}px)")
-    ax1.axis("off")
+    sw_enh = make_swatch_image(pal_enh)
 
-    # (2) Palette
-    ax2 = fig.add_subplot(gs[0, 1])
-    ax2.imshow(np.array(swatch))
-    ax2.set_title(f"Generated Palette (RGB K-Means, K={K})")
-    ax2.axis("off")
+    # -----------------------------
+    # VISUAL: 1x3 (NO quantized)
+    # -----------------------------
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+    fig.suptitle("SOP2 Enhancement (Resize <=512)", fontsize=16)
 
-    # (3) RGB cube
-    ax3 = fig.add_subplot(gs[1, 0], projection="3d")
-    plot_rgb_cube(ax3, pixels_list, "RGB Cube (Sampled Pixels)")
-
-    # (4) Explanation + evidence
-    ax4 = fig.add_subplot(gs[1, 1])
-    ax4.axis("off")
-    ax4.text(
-        0.05, 0.75,
-        "SOP 2 Observation (Dominant vs Rare Color Bias)\n\n"
-        f"• Patch color: {PATCH_COLOR}\n"
-        f"• Pixels near patch color: {near_count} / {total} (~{near_pct:.3f}%)\n"
-        f"• Palette captured patch color (±{NEAR_THRESH})? {has_patch}\n"
-        f"• Closest palette distance to patch: {best_d:.2f}\n\n"
-        "Why it happens:\n"
-        "• K-Means minimizes overall error.\n"
-        "• Dominant colors (many pixels) pull centroids.\n"
-        "• Small regions can be ignored if they don’t reduce the global error much.",
-        fontsize=10
+    # ✅ BIG summary line (now includes pixel counts)
+    fig.text(
+        0.5, 0.91,
+        f"BASE: {runtime_base:.2f}s | MSE: {final_mse_base:.2f} | Pixels: {orig_pixels:,}   ||   "
+        f"ENH: {runtime_enh:.2f}s | MSE: {final_mse_enh:.2f} | Pixels: {proc_pixels:,}   ||   "
+        f"Speedup: ~{speedup:.1f}× | K={K}",
+        ha="center", va="center",
+        fontsize=17, fontweight="bold"
     )
 
-    plt.suptitle("SOP 2 Visual: Rare-but-visible colors can be missed in palette generation", fontsize=14)
+    axes[0].imshow(plot_preview(orig))
+    axes[0].set_title(f"Original Upload ({ow}×{oh}px | {orig_pixels:,} px)", fontsize=13)
+    axes[0].axis("off")
+
+    axes[1].imshow(proc_img)
+    axes[1].set_title(f"Resized for Processing ({pw}×{ph}px | {proc_pixels:,} px)", fontsize=13)
+    axes[1].axis("off")
+
+    axes[2].imshow(np.asarray(sw_enh, dtype=np.uint8))
+    axes[2].set_title("ENH Final palette swatch", fontsize=13)
+    axes[2].axis("off")
+
+    plt.tight_layout(rect=[0, 0, 1, 0.88])
     plt.show()
