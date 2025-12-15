@@ -1,161 +1,149 @@
 # ==============================================
-# Visualization 2 – Real image + RGB palette swatch
-# Original  |  Quantized with RGB K-Means  |  Palette
+# SOP1 (Not Enhanced) – RGB Fast K-Means (2x2)
+# [ Original ] [ Quantized ]
+# [ RGB Cube  ] [ Swatch   ]
+# + prints iteration MSE + final palette
 # ==============================================
 
 from PIL import Image
 import numpy as np
 import matplotlib.pyplot as plt
 import random
-import math
+from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 
-# ------------- PARAMETERS ----------------
-
-IMAGE_PATH = "flower.jpg"   # <-- change to your test image
-K = 8                       # number of palette colors (7 or 8)
-MAX_ITER = 10               # K-Means iterations
-SEED = 1                    # for reproducibility
-
-# ------------- HELPER FUNCTIONS ----------------
+IMAGE_PATH = "starry.jpg"
+K = 8
+MAX_ITER = 10
+SEED = 1
+SAMPLE_POINTS = 5000
 
 def squared_euclidean(c1, c2):
-    """Squared Euclidean distance in RGB."""
     dr = c1[0] - c2[0]
     dg = c1[1] - c2[1]
     db = c1[2] - c2[2]
     return dr*dr + dg*dg + db*db
 
-def kmeans_rgb(pixels, K, max_iter=10, seed=None):
-    """
-    Plain K-Means in RGB using squared Euclidean distance.
-    Returns: palette (list of (R,G,B)), mse_history (per iteration).
-    """
+def kmeans_rgb(pixels, K, max_iter=10, seed=None, early_stop=True):
     if seed is not None:
         random.seed(seed)
 
     N = len(pixels)
-    if K > N:
-        K = N
+    K = min(K, N)
 
-    # random initialization from existing pixels
-    centroids = [list(c) for c in random.sample(pixels, K)]
+    centroids = [tuple(c) for c in random.sample(pixels, K)]
     mse_history = []
+    prev_mse = None
 
     for it in range(max_iter):
         clusters = [[] for _ in range(K)]
         mse_accum = 0.0
 
         # --- assignment step ---
-        for (r, g, b) in pixels:
-            dists = [squared_euclidean((r, g, b), (c[0], c[1], c[2]))
-                     for c in centroids]
-            k_idx = min(range(K), key=lambda i: dists[i])
-            clusters[k_idx].append((r, g, b))
-            mse_accum += dists[k_idx]
+        for p in pixels:
+            dists = [squared_euclidean(p, c) for c in centroids]
+            idx = int(np.argmin(dists))
+            clusters[idx].append(p)
+            mse_accum += dists[idx]
 
         mse = mse_accum / N
         mse_history.append(mse)
-        print(f"Iter {it}: MSE = {mse:.2f}")
+
+        # ✅ PRINT ITERATION COMPUTATION
+        print(f"[RGB] Iter {it}: MSE_RGB = {mse:.2f}")
+
+        # optional early stop (remove if you don't want it)
+        if early_stop and prev_mse is not None and mse >= prev_mse:
+            print("[RGB] Early stop: MSE did not improve.")
+            break
+        prev_mse = mse
 
         # --- update step ---
-        for k in range(K):
-            if clusters[k]:
-                sr = sum(p[0] for p in clusters[k]) / len(clusters[k])
-                sg = sum(p[1] for p in clusters[k]) / len(clusters[k])
-                sb = sum(p[2] for p in clusters[k]) / len(clusters[k])
-                centroids[k] = [int(sr), int(sg), int(sb)]
-            # if empty cluster: keep old centroid
+        new_centroids = []
+        for i in range(K):
+            if clusters[i]:
+                sr = sum(px[0] for px in clusters[i]) / len(clusters[i])
+                sg = sum(px[1] for px in clusters[i]) / len(clusters[i])
+                sb = sum(px[2] for px in clusters[i]) / len(clusters[i])
+                new_centroids.append((int(sr), int(sg), int(sb)))
+            else:
+                new_centroids.append(centroids[i])  # keep if empty cluster
+        centroids = new_centroids
 
-    palette = [tuple(c) for c in centroids]
-    return palette, mse_history
+    return centroids, mse_history
 
 def quantize_image(img, palette):
-    """
-    Quantize an image: each pixel -> nearest palette color (RGB Euclidean).
-    """
-    width, height = img.size
-    out = Image.new("RGB", (width, height))
-    pal = list(palette)
+    w, h = img.size
+    out = Image.new("RGB", (w, h))
+    src = img.load()
+    dst = out.load()
 
-    for y in range(height):
-        for x in range(width):
-            c = img.getpixel((x, y))
-            dists = [squared_euclidean(c, p) for p in pal]
-            k_idx = min(range(len(pal)), key=lambda i: dists[i])
-            out.putpixel((x, y), pal[k_idx])
+    for y in range(h):
+        for x in range(w):
+            p = src[x, y]
+            dists = [squared_euclidean(p, c) for c in palette]
+            dst[x, y] = palette[int(np.argmin(dists))]
 
     return out
 
-def make_swatch_image(palette, swatch_height=80, swatch_width_per_color=40):
-    """
-    Build a horizontal palette swatch image from a list of (R,G,B).
-    """
-    if not palette:
-        return None
+def make_swatch_image(palette, swatch_h=70, w_per=50):
+    img = Image.new("RGB", (w_per * len(palette), swatch_h))
+    for i, c in enumerate(palette):
+        for x in range(i * w_per, (i + 1) * w_per):
+            for y in range(swatch_h):
+                img.putpixel((x, y), c)
+    return img
 
-    w = swatch_width_per_color * len(palette)
-    h = swatch_height
-    swatch = Image.new("RGB", (w, h))
+def plot_rgb_cube(ax, pixels, title):
+    pts = np.array(pixels, dtype=np.uint8)
+    if len(pts) > SAMPLE_POINTS:
+        idx = np.random.choice(len(pts), SAMPLE_POINTS, replace=False)
+        pts = pts[idx]
 
-    for i, color in enumerate(palette):
-        for x in range(i * swatch_width_per_color,
-                       (i + 1) * swatch_width_per_color):
-            for y in range(h):
-                swatch.putpixel((x, y), color)
-
-    return swatch
-
-# ------------- MAIN EXPERIMENT ----------------
+    ax.scatter(pts[:, 0], pts[:, 1], pts[:, 2], c=pts/255.0, s=2, alpha=0.6)
+    ax.set_xlim(0, 255); ax.set_ylim(0, 255); ax.set_zlim(0, 255)
+    ax.set_xlabel("Red"); ax.set_ylabel("Green"); ax.set_zlabel("Blue")
+    ax.set_title(title)
 
 if __name__ == "__main__":
-    # 1) Load image and convert to RGB
-    orig_img = Image.open(IMAGE_PATH).convert("RGB")
-    width, height = orig_img.size
-
-    # 2) Flatten pixels for K-Means
-    pixels = [orig_img.getpixel((x, y))
-              for y in range(height)
-              for x in range(width)]
+    orig = Image.open(IMAGE_PATH).convert("RGB")
+    pixels = list(orig.getdata())
     print(f"Total pixels: {len(pixels)}")
 
-    # 3) Run K-Means in RGB
-    print(f"\nRunning K-Means in RGB with K={K} ...")
-    palette, mse_history = kmeans_rgb(pixels, K=K,
-                                      max_iter=MAX_ITER,
-                                      seed=SEED)
-    final_mse = mse_history[-1]
-    print(f"\nFinal MSE (RGB): {final_mse:.2f}")
+    palette, mse_hist = kmeans_rgb(pixels, K, MAX_ITER, SEED, early_stop=True)
+    final_mse = mse_hist[-1]
 
-    print("\nFinal palette (RGB):")
+    print("\nFinal palette (RGB centroids):")
     for i, c in enumerate(palette):
         print(f"  c{i}: {c}")
 
-    # 4) Quantize the image using this palette
-    quant_img = quantize_image(orig_img, palette)
+    quant = quantize_image(orig, palette)
+    swatch = make_swatch_image(palette)
 
-    # 5) Build palette swatch image
-    swatch_img = make_swatch_image(palette)
+    # -------- 2x2 Figure --------
+    fig = plt.figure(figsize=(12, 8))
+    gs = fig.add_gridspec(2, 2, height_ratios=[3, 2], wspace=0.25, hspace=0.35)
 
-    # 6) Plot: Original | Quantized | Palette
-    fig, axes = plt.subplots(1, 3, figsize=(12, 4))
+    fig.suptitle(
+        f"RGB Fast K-Means Visualization (Final MSE={final_mse:.2f})",
+        fontsize=13
+    )
 
-    # Original
-    axes[0].imshow(np.array(orig_img))
-    axes[0].set_title("Original image")
-    axes[0].axis("off")
+    ax_orig = fig.add_subplot(gs[0, 0])
+    ax_orig.imshow(orig)
+    ax_orig.set_title("Original image")
+    ax_orig.axis("off")
 
-    # Quantized
-    axes[1].imshow(np.array(quant_img))
-    axes[1].set_title(f"Quantized (RGB K-Means, K={K})")
-    axes[1].axis("off")
+    ax_quant = fig.add_subplot(gs[0, 1])
+    ax_quant.imshow(quant)
+    ax_quant.set_title(f"Quantized (RGB K-Means, K={K})")
+    ax_quant.axis("off")
 
-    # Palette swatch
-    if swatch_img is not None:
-        axes[2].imshow(np.array(swatch_img))
-    axes[2].set_title("RGB palette swatch")
-    axes[2].axis("off")
+    ax_cube = fig.add_subplot(gs[1, 0], projection="3d")
+    plot_rgb_cube(ax_cube, pixels, "RGB Cube (Sampled pixels)")
 
-    plt.suptitle(f"Real-image visualization of RGB Fast K-Means (Final MSE={final_mse:.2f})",
-                 fontsize=11)
-    plt.tight_layout()
+    ax_swatch = fig.add_subplot(gs[1, 1])
+    ax_swatch.imshow(np.array(swatch))
+    ax_swatch.set_title("RGB palette swatch")
+    ax_swatch.axis("off")
+
     plt.show()

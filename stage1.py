@@ -1,11 +1,11 @@
 # ======================================================
 # Stage 1 ONLY – RGB Cube Initial Palette Generation
-# (Based on Huang, 2021)
+# Accurate to Huang (2021) Initial Palette
 # ======================================================
 
 from PIL import Image
 import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D
+from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 from tqdm import tqdm
 import random
 import math
@@ -14,14 +14,15 @@ import math
 
 IMAGE_PATH = "flower.jpg"   # <-- your image
 K = 7                        # desired number of palette colors
-CUBE_BINS = 16               # RGB cube division per axis
-COUNT_THRESHOLD = 1          # Thr: minimum pixel count for a cube to be considered
+CUBE_BINS = 16               # must be 16 to match Huang (16x16x16 cubes)
+COUNT_THRESHOLD = 6          # Thr in the paper is often >= 6 (you can change)
 
 # ----------------- HELPER FUNCTIONS -----------------
 
 def rgb_to_cube_index(r, g, b, bins):
     """
     Map an RGB color to a cube index in a bins x bins x bins grid.
+    Each cube side length = 256 / bins (16 when bins=16).
     """
     rb = (r * bins) // 256
     gb = (g * bins) // 256
@@ -30,7 +31,7 @@ def rgb_to_cube_index(r, g, b, bins):
 
 def squared_euclidean(c1, c2):
     """
-    Squared Euclidean distance SED(c1, c2).
+    Squared Euclidean distance SED(c1, c2) in RGB.
     """
     dr = c1[0] - c2[0]
     dg = c1[1] - c2[1]
@@ -43,10 +44,11 @@ def build_rgb_cubes(img, bins, count_threshold):
     """
     Build initc(i) and initn(i) using an RGB cube.
 
-    - Divide RGB space into bins^3 cubes.
+    - Divide RGB space into bins^3 cubes (16^3 = 4096 for Huang).
     - For each cube, accumulate count and sum of RGB.
-    - For cubes with count >= Thr, compute mean color (initc)
-      and frequency (initn).
+    - For cubes with count >= Thr, compute:
+        initc(i) = rounded mean RGB of points in that cube
+        initn(i) = number of points in that cube
     """
     width, height = img.size
     cube_stats = {}   # key: (rb,gb,bb), value: dict(count, sum_r, sum_g, sum_b)
@@ -63,35 +65,36 @@ def build_rgb_cubes(img, bins, count_threshold):
             if cube_idx not in cube_stats:
                 cube_stats[cube_idx] = {
                     "count": 0,
-                    "sum_r": 0,
-                    "sum_g": 0,
-                    "sum_b": 0
+                    "sum_r": 0.0,
+                    "sum_g": 0.0,
+                    "sum_b": 0.0
                 }
             cube_stats[cube_idx]["count"] += 1
             cube_stats[cube_idx]["sum_r"] += r
             cube_stats[cube_idx]["sum_g"] += g
             cube_stats[cube_idx]["sum_b"] += b
 
-    # build initc(i), initn(i) from cubes that pass threshold
-    initc = []  # candidate colors
-    initn = []  # their frequencies
+    # ----- build initc(i), initn(i) from cubes that pass threshold -----
+    initc = []  # candidate colors (centers of mCube(i))
+    initn = []  # their frequencies (point numbers in mCube(i))
 
     for stats in cube_stats.values():
         if stats["count"] >= count_threshold:
             c_count = stats["count"]
-            mean_r = stats["sum_r"] // c_count
-            mean_g = stats["sum_g"] // c_count
-            mean_b = stats["sum_b"] // c_count
+            # IMPORTANT: use rounded mean, like the example in Huang (85,116,37)
+            mean_r = int(round(stats["sum_r"] / c_count))
+            mean_g = int(round(stats["sum_g"] / c_count))
+            mean_b = int(round(stats["sum_b"] / c_count))
+
             initc.append((mean_r, mean_g, mean_b))
             initn.append(c_count)
 
-    print(f"Number of candidate colors (initc): {len(initc)}")
-
+    print(f"Number of candidate colors N (initc): {len(initc)}")
     return initc, initn, all_pixels
 
 def initial_palette_generation(initc, initn, K):
     """
-    Stage 1: Initial Palette Generation (existing algorithm)
+    Stage 1: Initial Palette Generation (Huang 2021)
 
     Step 1: Selected(i) = 0, Cno = 0.
     Step 2: choose initc(j) with max initn(j).
@@ -115,6 +118,8 @@ def initial_palette_generation(initc, initn, K):
     selected[j] = True
     palette.append(initc[j])
     Cno += 1
+
+    print(f"First selected color (most frequent): {initc[j]}, count = {initn[j]}")
 
     # Step 3 & 4: iteratively add colors until we have K colors
     while Cno < K:
@@ -140,6 +145,7 @@ def initial_palette_generation(initc, initn, K):
         selected[best_idx] = True
         palette.append(initc[best_idx])
         Cno += 1
+        print(f"Selected color #{Cno}: {initc[best_idx]}, count = {initn[best_idx]}, DistN = {best_score:.2f}")
 
     print(f"Initial palette generated (Stage 1) with {len(palette)} colors.")
     return palette
@@ -211,6 +217,10 @@ if __name__ == "__main__":
     )
 
     initial_palette = initial_palette_generation(initc, initn, K=K)
+
+    print("\nFinal Stage 1 palette (RGB):")
+    for idx, c in enumerate(initial_palette):
+        print(f"{idx+1}: {c}")
 
     # Visualize Stage 1 result
     show_palette_swatch(initial_palette)

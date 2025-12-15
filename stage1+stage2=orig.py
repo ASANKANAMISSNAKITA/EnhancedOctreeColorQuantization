@@ -1,11 +1,14 @@
 # ======================================================
 # RGB Cube + Fast K-Means Palette Generation System
-# (Existing Algorithm based on Huang: Stage 1 + Stage 2)
+# Existing Algorithm (Huang 2021) with:
+#  - Stage 1: RGB cube initial palette
+#  - Stage 2: Fast K-Means + Wu–Lin
+#  - Block-based sampling (rates: 1, 0.5, 0.25, 0.125, 0.0625, 0.03125)
 # ======================================================
 
 from PIL import Image
 import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D
+from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 from tqdm import tqdm
 import random
 import math
@@ -14,10 +17,13 @@ import math
 
 IMAGE_PATH = "flower.jpg"   # <-- your image
 K = 7                       # desired number of palette colors
-CUBE_BINS = 16               # RGB cube division per axis
-COUNT_THRESHOLD = 1          # Thr: minimum pixel count for a cube to be considered
-SAMPLE_RATE = 0.1            # fraction of pixels used for K-Means refinement
-MAX_ITER = 10                # Max_cycle in the paper
+CUBE_BINS = 16              # RGB cube division per axis (16 => 4096 cubes)
+COUNT_THRESHOLD = 1         # Thr: minimum pixel count for a cube to be considered
+
+# IMPORTANT: use one of the discrete rates from the paper:
+# 1.0, 0.5, 0.25, 0.125, 0.0625, 0.03125
+SAMPLE_RATE = 0.125         # data sampling rate for Stage 2
+MAX_ITER = 10               # Max_cycle in the paper
 
 # ----------------- HELPER FUNCTIONS -----------------
 
@@ -39,24 +45,104 @@ def squared_euclidean(c1, c2):
     db = c1[2] - c2[2]
     return dr*dr + dg*dg + db*db
 
+# ------------- WU–LIN NEAREST-PALETTE ACCELERATION -------------
+
+def wu_lin_nearest_color(r, g, b, palette, norms, len2s):
+    """
+    Wu–Lin accelerated nearest-palette search for one pixel x = (r,g,b).
+
+    palette : list of [R,G,B] colors, sorted by length ||y||
+    norms   : precomputed ||y|| for each palette entry
+    len2s   : precomputed ||y||^2 for each palette entry
+
+    Returns: (nearest_index, SED(x, y_nearest))
+    """
+    # ||x||^2 and ||x||
+    x2 = r*r + g*g + b*b
+    x_norm = math.sqrt(x2)
+
+    K = len(palette)
+
+    # ---- 1) find index whose ||y|| is closest to ||x|| ----
+    lo, hi = 0, K - 1
+    best_k = 0
+    best_diff = float('inf')
+
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        diff = norms[mid] - x_norm
+        abs_diff = abs(diff)
+        if abs_diff < best_diff:
+            best_diff = abs_diff
+            best_k = mid
+
+        if diff < 0:
+            lo = mid + 1
+        elif diff > 0:
+            hi = mid - 1
+        else:
+            break  # exact match
+
+    # helper to evaluate a candidate palette index
+    def consider(idx, sed1_min, nearest_idx):
+        y = palette[idx]
+        len2 = len2s[idx]
+        # dot(x,y)
+        dot_xy = r*y[0] + g*y[1] + b*y[2]
+        # SED1(x,y) = ||y||^2 - 2 * dot(x,y)
+        sed1 = len2 - 2.0 * dot_xy
+        if sed1 < sed1_min:
+            return sed1, idx
+        return sed1_min, nearest_idx
+
+    # ---- 2) evaluate the closest-length color first ----
+    sed1_min = float('inf')
+    nearest_idx = best_k
+    sed1_min, nearest_idx = consider(best_k, sed1_min, nearest_idx)
+
+    # ---- 3) scan left with Wu–Lin kick-out condition ----
+    i = best_k - 1
+    while i >= 0:
+        y_norm = norms[i]
+        # Wu–Lin lower bound: ||y|| (||y|| − 2||x||)
+        lower_bound = y_norm * (y_norm - 2.0 * x_norm)
+        if lower_bound >= sed1_min:
+            break  # no closer color further in this direction
+        sed1_min, nearest_idx = consider(i, sed1_min, nearest_idx)
+        i -= 1
+
+    # ---- 4) scan right with Wu–Lin kick-out condition ----
+    i = best_k + 1
+    while i < K:
+        y_norm = norms[i]
+        lower_bound = y_norm * (y_norm - 2.0 * x_norm)
+        if lower_bound >= sed1_min:
+            break
+        sed1_min, nearest_idx = consider(i, sed1_min, nearest_idx)
+        i += 1
+
+    # Convert SED1 back to full SED:
+    # SED(x,y) = ||x||^2 + SED1(x,y)
+    sed = x2 + sed1_min
+    return nearest_idx, sed
+
 # ----------------- STAGE 1: INITIAL PALETTE (RGB CUBE) -----------------
 
-def build_rgb_cubes(img, bins, count_threshold, sample_rate):
+def build_rgb_cubes(img, bins, count_threshold):
     """
     Build initc(i) and initn(i) using an RGB cube.
-    Also collect sampled pixels SCP_i for Stage 2.
+
+    Stage 1 uses *all* pixels (no sampling).
     """
     width, height = img.size
     cube_stats = {}   # key: (rb,gb,bb), value: dict(count, sum_r, sum_g, sum_b)
-    sampled_pixels = []
 
-    print("Scanning image and building RGB cubes...")
+    print("Scanning image and building RGB cubes (Stage 1)...")
 
     for y in tqdm(range(height), desc="Rows processed"):
         for x in range(width):
             r, g, b = img.getpixel((x, y))
 
-            # --- update cube stats ---
             cube_idx = rgb_to_cube_index(r, g, b, bins)
             if cube_idx not in cube_stats:
                 cube_stats[cube_idx] = {
@@ -70,10 +156,6 @@ def build_rgb_cubes(img, bins, count_threshold, sample_rate):
             cube_stats[cube_idx]["sum_g"] += g
             cube_stats[cube_idx]["sum_b"] += b
 
-            # --- sample pixels for Stage 2 (SCP_i) ---
-            if random.random() < sample_rate:
-                sampled_pixels.append((r, g, b))
-
     # build initc(i), initn(i) from cubes that pass threshold
     initc = []  # candidate colors
     initn = []  # their frequencies
@@ -81,6 +163,7 @@ def build_rgb_cubes(img, bins, count_threshold, sample_rate):
     for stats in cube_stats.values():
         if stats["count"] >= count_threshold:
             c_count = stats["count"]
+            # (you can switch to round(...) if you want exact Huang behavior)
             mean_r = stats["sum_r"] // c_count
             mean_g = stats["sum_g"] // c_count
             mean_b = stats["sum_b"] // c_count
@@ -88,9 +171,83 @@ def build_rgb_cubes(img, bins, count_threshold, sample_rate):
             initn.append(c_count)
 
     print(f"Number of candidate colors (initc): {len(initc)}")
-    print(f"Number of sampled pixels for Stage 2 (SPN): {len(sampled_pixels)}")
+    return initc, initn
 
-    return initc, initn, sampled_pixels
+# ----------------- BLOCK-BASED SAMPLING (STAGE 2 INPUT) -----------------
+
+def block_sample_pixels(img, sampling_rate):
+    """
+    Block-based sampling to match Huang's discrete sampling rates:
+      1.0    -> all pixels
+      0.5    -> 2 pixels per 2x2 block
+      0.25   -> 1 pixel per 2x2 block
+      0.125  -> 2 pixels per 4x4 block
+      0.0625 -> 1 pixel per 4x4 block
+      0.03125 -> 2 pixels per 8x8 block
+
+    For other rates, falls back to per-pixel random sampling.
+    """
+    width, height = img.size
+    sampled = []
+
+    # sampling_rate = 1.0 -> every pixel
+    if abs(sampling_rate - 1.0) < 1e-9:
+        for y in range(height):
+            for x in range(width):
+                sampled.append(img.getpixel((x, y)))
+        print(f"Sampling rate 1.0: sampled all {len(sampled)} pixels.")
+        return sampled
+
+    # Decide block size and samples per block
+    if abs(sampling_rate - 0.5) < 1e-9:
+        block_size = 2
+        samples_per_block = 2
+    elif abs(sampling_rate - 0.25) < 1e-9:
+        block_size = 2
+        samples_per_block = 1
+    elif abs(sampling_rate - 0.125) < 1e-9:
+        block_size = 4
+        samples_per_block = 2
+    elif abs(sampling_rate - 0.0625) < 1e-9:
+        block_size = 4
+        samples_per_block = 1
+    elif abs(sampling_rate - 0.03125) < 1e-9:
+        block_size = 8
+        samples_per_block = 2
+    else:
+        # fallback: simple per-pixel random sampling like your original code
+        print(f"Sampling rate {sampling_rate} not in Huang's set; using random per-pixel sampling.")
+        for y in range(height):
+            for x in range(width):
+                if random.random() < sampling_rate:
+                    sampled.append(img.getpixel((x, y)))
+        print(f"Random sampling: sampled {len(sampled)} pixels "
+              f"(effective rate ~ {len(sampled)/(width*height):.5f})")
+        return sampled
+
+    # Block-based sampling
+    for by in range(0, height, block_size):
+        for bx in range(0, width, block_size):
+            coords = []
+            for y in range(by, min(by + block_size, height)):
+                for x in range(bx, min(bx + block_size, width)):
+                    coords.append((x, y))
+            if not coords:
+                continue
+
+            k = min(samples_per_block, len(coords))
+            chosen = random.sample(coords, k)
+            for (x, y) in chosen:
+                sampled.append(img.getpixel((x, y)))
+
+    effective_rate = len(sampled) / (width * height)
+    print(f"Block-based sampling: rate={sampling_rate}, "
+          f"sampled {len(sampled)} pixels "
+          f"(effective rate ~ {effective_rate:.5f})")
+
+    return sampled
+
+# ----------------- INITIAL PALETTE (STAGE 1) -----------------
 
 def initial_palette_generation(initc, initn, K):
     """
@@ -147,19 +304,11 @@ def initial_palette_generation(initc, initn, K):
     print(f"Initial palette generated (Stage 1) with {len(palette)} colors.")
     return palette
 
-# ----------------- STAGE 2: FAST K-MEANS PALETTE REFINEMENT -----------------
+# ----------------- STAGE 2: FAST K-MEANS + WU–LIN -----------------
 
 def fast_kmeans_palette_refinement(sampled_pixels, initial_palette, max_iter=10):
     """
-    Stage 2: Fast K-Means Algorithm (existing algorithm)
-
-    Step 1: SCP_i sampling, Iter = 0, StopF = 0.
-    Step 2: assign each SCP_i to nearest palette color CCP_i.
-    Step 3: compute mean of K groups and sort palette by length.
-    Step 4: MSE1(Iter) = (1 / SPN) * sum_i SED(SCP_i, CCP_i).
-            If Iter > 0 and MSE1(Iter) >= MSE1(Iter - 1), StopF = 1.
-    Step 5: Iter = Iter + 1; if Iter == Max_cycle or StopF == 1, stop.
-    Step 6: output final palette and Iter.
+    Stage 2: Fast K-Means Algorithm (existing algorithm + Wu–Lin acceleration)
     """
     if not sampled_pixels:
         print("No sampled pixels, skipping Stage 2 refinement.")
@@ -169,21 +318,35 @@ def fast_kmeans_palette_refinement(sampled_pixels, initial_palette, max_iter=10)
     K = len(palette)
     SPN = len(sampled_pixels)
 
-    # Step 1
     Iter = 0
     StopF = 0
     prev_mse = None
 
     while Iter < max_iter and not StopF:
-        # Step 2: assignment step
+        # --- precompute norms and squared norms for current palette ---
+        len2s = []
+        norms = []
+        for c in palette:
+            l2 = c[0]*c[0] + c[1]*c[1] + c[2]*c[2]
+            len2s.append(l2)
+            norms.append(math.sqrt(l2))
+
+        # ensure palette is sorted by length (ascending)
+        combined = list(zip(palette, norms, len2s))
+        combined.sort(key=lambda t: t[1])  # sort by ||y||
+        palette, norms, len2s = zip(*combined)
+        palette = [list(c) for c in palette]
+        norms = list(norms)
+        len2s = list(len2s)
+
+        # Step 2: assignment step (Wu–Lin nearest search)
         clusters = [[] for _ in range(K)]
         mse_accum = 0.0
 
         for (r, g, b) in sampled_pixels:
-            dists = [squared_euclidean((r, g, b), (p[0], p[1], p[2])) for p in palette]
-            k_idx = min(range(K), key=lambda idx: dists[idx])
+            k_idx, sed = wu_lin_nearest_color(r, g, b, palette, norms, len2s)
             clusters[k_idx].append((r, g, b))
-            mse_accum += dists[k_idx]  # SED(SCP_i, CCP_i)
+            mse_accum += sed  # SED(SCP_i, CCP_i)
 
         # Step 4: compute MSE1(Iter)
         MSE1_iter = mse_accum / SPN
@@ -202,10 +365,9 @@ def fast_kmeans_palette_refinement(sampled_pixels, initial_palette, max_iter=10)
                 palette[k] = [int(sr), int(sg), int(sb)]
             # if cluster is empty, keep old color
 
-        # sort K palette colors in ascending order of length
+        # sort K palette colors in ascending order of length for next iteration
         palette.sort(key=lambda c: c[0]**2 + c[1]**2 + c[2]**2)
 
-        # Step 5: Iter = Iter + 1
         Iter += 1
 
     refined_palette = [tuple(c) for c in palette]
@@ -271,17 +433,18 @@ if __name__ == "__main__":
     # load image
     img = Image.open(IMAGE_PATH).convert("RGB")
 
-    # Stage 1: build RGB cubes and generate initial palette
-    initc, initn, sampled_pixels = build_rgb_cubes(
+    # Stage 1: build RGB cubes and generate initial palette (no sampling here)
+    initc, initn = build_rgb_cubes(
         img,
         bins=CUBE_BINS,
-        count_threshold=COUNT_THRESHOLD,
-        sample_rate=SAMPLE_RATE
+        count_threshold=COUNT_THRESHOLD
     )
 
     initial_palette = initial_palette_generation(initc, initn, K=K)
 
-    # Stage 2: refine palette with fast K-Means on sampled pixels
+    # Stage 2: block-based sampling + fast K-Means
+    sampled_pixels = block_sample_pixels(img, SAMPLE_RATE)
+
     final_palette = fast_kmeans_palette_refinement(
         sampled_pixels,
         initial_palette,
