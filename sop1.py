@@ -11,7 +11,7 @@ import matplotlib.pyplot as plt
 import random
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 
-IMAGE_PATH = "starry.jpg"
+IMAGE_PATH = "flower.jpg"
 K = 8
 MAX_ITER = 10
 SEED = 1

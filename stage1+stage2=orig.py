@@ -16,13 +16,13 @@ import math
 # ----------------- PARAMETERS -----------------
 
 IMAGE_PATH = "flower.jpg"   # <-- your image
-K = 7                       # desired number of palette colors
+K = 8                       # desired number of palette colors
 CUBE_BINS = 16              # RGB cube division per axis (16 => 4096 cubes)
 COUNT_THRESHOLD = 1         # Thr: minimum pixel count for a cube to be considered
 
 # IMPORTANT: use one of the discrete rates from the paper:
 # 1.0, 0.5, 0.25, 0.125, 0.0625, 0.03125
-SAMPLE_RATE = 0.125         # data sampling rate for Stage 2
+SAMPLE_RATE = 1         # data sampling rate for Stage 2
 MAX_ITER = 10               # Max_cycle in the paper
 
 # ----------------- HELPER FUNCTIONS -----------------
