@@ -11,7 +11,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import time
 
-IMAGE_PATH = "birdhouse.jpg"
+IMAGE_PATH = "park.jpg"
 K = 8
 MAX_ITER = 10
 PROCESS_MAX = 512

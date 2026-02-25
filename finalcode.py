@@ -1,67 +1,114 @@
 # ==========================================================
-# SOP1 + SOP2 + SOP3 (ENHANCED) — Single Script (Matches Your Architecture)
+# SOP1 + SOP2 + SOP3 (ENHANCED) — FAST VERSION (same logic, fixed speed)
 #
-# Stage 1 (Existing / Huang 2021):
-#   Input Image -> RGB Cube Binning -> Pick Most Frequent -> Pick Most Distinct -> Initialized Palette
+# Stage 1: RGB Cube binning -> most frequent -> most distinct -> init palette
+# Stage 2: Resize <=512 -> Sampling -> RGB->CIELAB -> Assign nearest -> Update means -> MSE stop
+# Stage 3: ΔE76 de-duplicate (threshold=4) with reseeding from sampled pixels
 #
-# Stage 2 (Enhanced for SOP1 + SOP2):
-#   Initialized Palette + Image -> Resize ≤512 -> Sampling -> RGB→CIELAB -> Assign Nearest (Wu–Lin)
-#   -> Update Means -> MSE Stop Checker -> Stage2 Palette
-#
-# Stage 3 (SOP3 Enhancement — Perceptual Separation using ΔE, threshold=4):
-#   Stage2 Palette (CIELAB) -> Check pairwise ΔE76 -> If any pair < 4:
-#   keep stronger color (bigger cluster support), replace weaker slot by selecting a new color
-#   that maximizes minimum ΔE distance from the current palette (from sampled pixels).
-#
-# SPEED FIXES (keeps same logic but faster):
-#   ✅ Convert sampled pixels RGB→LAB ONCE (not per-iteration)
-#   ✅ Convert palette RGB→LAB once per iteration (palette updates each iter)
-#   ✅ Quantized preview uses DOWNSCALED image (fast) + vectorized distance
-#
-# Requires: pillow, numpy, matplotlib, tqdm, scikit-image
+# VIS FIX:
+#   ✅ Quantized output is generated at proc_img resolution (NOT 256 preview)
+#   ✅ imshow interpolation disabled (crisper display)
+#   ✅ Figure size stays EXACTLY (12, 8)
 # ==========================================================
 
 from PIL import Image
 import numpy as np
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
-from tqdm import tqdm
 import random
 import math
 import time
 from skimage.color import rgb2lab, lab2rgb
 
 # ----------------- PARAMETERS -----------------
-IMAGE_PATH = "4.1.02.tiff"
+IMAGE_PATH = "kodim02.png"
 
-K = 8
+K = 10
 CUBE_BINS = 16
 COUNT_THRESHOLD = 1
 
-# Huang discrete sampling rates:
-# 1.0, 0.5, 0.25, 0.125, 0.0625, 0.03125
 SAMPLE_RATE = 0.25
-
 MAX_ITER = 10
 RANDOM_SEED = 1
 
-# SOP2: Stage 2 processing cap
 PROCESS_MAX = 512
 
-# SOP3: perceptual separation threshold (ΔE76 in Lab)
-DELTA_E_THRESH = 4.0
-SOP3_PASSES = 2                 # how many times to re-check after reseeding
-SOP3_CANDIDATES = 2500          # how many sampled pixels to consider for reseeding (speed knob)
+DELTA_E_THRESH = 3.5
+SOP3_PASSES = 2
+SOP3_CANDIDATES = 2500  # speed knob
 
-# Visual controls
 SPHERE_POINTS = 5000
-QUANT_PREVIEW_MAX = 256  # quantize preview downscale cap (speed)
+
+# Stage2 speed knob (prevents NxK memory blow-up on huge images)
+CHUNK_SIZE = 120000  # 50k–300k depending on RAM
+
 
 # ============================================================
-# STAGE 1 — RGB CUBE (Existing)
+# Helpers
 # ============================================================
-def rgb_to_cube_index(r, g, b, bins):
-    return ((r * bins) // 256, (g * bins) // 256, (b * bins) // 256)
+def resize_to_max(img, max_side=512):
+    w, h = img.size
+    if max(w, h) <= max_side:
+        return img, False
+    scale = max_side / float(max(w, h))
+    new_w = int(round(w * scale))
+    new_h = int(round(h * scale))
+    try:
+        resample = Image.Resampling.BILINEAR
+    except AttributeError:
+        resample = Image.BILINEAR
+    return img.resize((new_w, new_h), resample), True
+
+
+def rgb_list_to_lab_array(rgb_list_or_arr):
+    """Accept list[(R,G,B)] or ndarray(N,3) uint8 -> lab (N,3) float32"""
+    arr = np.asarray(rgb_list_or_arr, dtype=np.float32) / 255.0
+    lab = rgb2lab(arr.reshape(-1, 1, 3)).reshape(-1, 3)
+    return lab.astype(np.float32)
+
+
+def lab_array_to_rgb_list(lab_arr):
+    rgb = lab2rgb(lab_arr.reshape(-1, 1, 3)).reshape(-1, 3)
+    rgb_u8 = np.clip(rgb * 255.0, 0, 255).astype(np.uint8)
+    return [tuple(map(int, c)) for c in rgb_u8]
+
+
+# ============================================================
+# STAGE 1 — RGB CUBE (FAST vectorized)
+# ============================================================
+def build_rgb_cubes_fast(img, bins, count_threshold):
+    arr = np.asarray(img, dtype=np.uint8)  # (H,W,3)
+    pix = arr.reshape(-1, 3).astype(np.int32)  # (N,3)
+    N = pix.shape[0]
+
+    rb = (pix[:, 0] * bins) // 256
+    gb = (pix[:, 1] * bins) // 256
+    bb = (pix[:, 2] * bins) // 256
+
+    cube_id = (rb * bins + gb) * bins + bb
+    B3 = bins * bins * bins
+
+    counts = np.bincount(cube_id, minlength=B3).astype(np.int32)
+    sum_r = np.bincount(cube_id, weights=pix[:, 0], minlength=B3)
+    sum_g = np.bincount(cube_id, weights=pix[:, 1], minlength=B3)
+    sum_b = np.bincount(cube_id, weights=pix[:, 2], minlength=B3)
+
+    mask = counts >= count_threshold
+    idxs = np.nonzero(mask)[0]
+
+    initc = []
+    initn = []
+    for cid in idxs:
+        c = counts[cid]
+        mr = int(sum_r[cid] // c)
+        mg = int(sum_g[cid] // c)
+        mb = int(sum_b[cid] // c)
+        initc.append((mr, mg, mb))
+        initn.append(int(c))
+
+    print(f"Stage 1: Candidate colors initc = {len(initc)} (from {N:,} pixels)")
+    return initc, initn
+
 
 def squared_euclidean_rgb(c1, c2):
     dr = c1[0] - c2[0]
@@ -69,34 +116,8 @@ def squared_euclidean_rgb(c1, c2):
     db = c1[2] - c2[2]
     return dr*dr + dg*dg + db*db
 
-def build_rgb_cubes(img, bins, count_threshold):
-    """Stage 1 uses ALL pixels (no resize, no sampling)."""
-    W, H = img.size
-    cube_stats = {}  # (rb,gb,bb) -> [count, sumR, sumG, sumB]
-
-    print("Stage 1: RGB Cube Binning...")
-    for y in tqdm(range(H), desc="Stage 1 rows"):
-        for x in range(W):
-            r, g, b = img.getpixel((x, y))
-            idx = rgb_to_cube_index(r, g, b, bins)
-            if idx not in cube_stats:
-                cube_stats[idx] = [0, 0, 0, 0]
-            cube_stats[idx][0] += 1
-            cube_stats[idx][1] += r
-            cube_stats[idx][2] += g
-            cube_stats[idx][3] += b
-
-    initc, initn = [], []
-    for count, sr, sg, sb in cube_stats.values():
-        if count >= count_threshold:
-            initc.append((sr // count, sg // count, sb // count))
-            initn.append(count)
-
-    print(f"Stage 1: Candidate colors initc = {len(initc)}")
-    return initc, initn
 
 def initial_palette_generation(initc, initn, K):
-    """Pick Most Frequent then Pick Most Distinct (same structure as your original)."""
     N = len(initc)
     if N == 0:
         return []
@@ -105,12 +126,10 @@ def initial_palette_generation(initc, initn, K):
     selected = [False] * N
     palette = []
 
-    # Pick Most Frequent
     j = max(range(N), key=lambda i: initn[i])
     selected[j] = True
     palette.append(initc[j])
 
-    # Pick Most Distinct (DistN)
     while len(palette) < K:
         best_i, best_score = None, -1.0
         for i in range(N):
@@ -128,34 +147,19 @@ def initial_palette_generation(initc, initn, K):
     print(f"Stage 1: Initialized palette size = {len(palette)}")
     return palette
 
-# ============================================================
-# STAGE 2 PRE-STEP — SOP2 Resize ≤512
-# ============================================================
-def resize_to_max(img, max_side=512):
-    w, h = img.size
-    if max(w, h) <= max_side:
-        return img, False
-    scale = max_side / float(max(w, h))
-    new_w = int(round(w * scale))
-    new_h = int(round(h * scale))
-    try:
-        resample = Image.Resampling.BILINEAR
-    except AttributeError:
-        resample = Image.BILINEAR
-    return img.resize((new_w, new_h), resample), True
 
 # ============================================================
 # STAGE 2 INPUT — Sampling (Huang discrete rates)
 # ============================================================
 def block_sample_pixels(img, sampling_rate):
     W, H = img.size
-    sampled = []
 
     if abs(sampling_rate - 1.0) < 1e-9:
-        sampled = list(img.getdata())
-        print(f"Stage 2: Sampling rate 1.0 -> {len(sampled)} pixels")
+        sampled = np.asarray(img, dtype=np.uint8).reshape(-1, 3)
+        print(f"Stage 2: Sampling rate 1.0 -> {len(sampled):,} pixels")
         return sampled
 
+    sampled = []
     if abs(sampling_rate - 0.5) < 1e-9:
         bs, spb = 2, 2
     elif abs(sampling_rate - 0.25) < 1e-9:
@@ -172,7 +176,8 @@ def block_sample_pixels(img, sampling_rate):
             for x in range(W):
                 if random.random() < sampling_rate:
                     sampled.append(img.getpixel((x, y)))
-        print(f"Stage 2: Random sampled -> {len(sampled)} pixels")
+        sampled = np.asarray(sampled, dtype=np.uint8).reshape(-1, 3)
+        print(f"Stage 2: Random sampled -> {len(sampled):,} pixels")
         return sampled
 
     for by in range(0, H, bs):
@@ -186,121 +191,54 @@ def block_sample_pixels(img, sampling_rate):
             for (x, y) in chosen:
                 sampled.append(img.getpixel((x, y)))
 
+    sampled = np.asarray(sampled, dtype=np.uint8).reshape(-1, 3)
     eff = len(sampled) / float(W * H)
-    print(f"Stage 2: Block sampling rate={sampling_rate} -> {len(sampled)} pixels (eff~{eff:.5f})")
+    print(f"Stage 2: Block sampling rate={sampling_rate} -> {len(sampled):,} pixels (eff~{eff:.5f})")
     return sampled
 
-# ============================================================
-# SOP1 — RGB→CIELAB conversion helpers (VECTORIZED)
-# ============================================================
-def rgb_list_to_lab_array(rgb_list):
-    """rgb_list: list[(R,G,B)] uint8 -> lab (N,3) float32"""
-    arr = np.asarray(rgb_list, dtype=np.float32) / 255.0
-    lab = rgb2lab(arr.reshape(-1, 1, 3)).reshape(-1, 3)
-    return lab.astype(np.float32)
-
-def lab_array_to_rgb_list(lab_arr):
-    """lab_arr: (K,3) -> list[(R,G,B)] uint8"""
-    rgb = lab2rgb(lab_arr.reshape(-1, 1, 3)).reshape(-1, 3)
-    rgb_u8 = np.clip(rgb * 255.0, 0, 255).astype(np.uint8)
-    return [tuple(map(int, c)) for c in rgb_u8]
 
 # ============================================================
-# WU–LIN acceleration on 3D vectors (Lab)
+# STAGE 2 — Fast K-Means in CIELAB (FAST chunked assignment)
 # ============================================================
-def _prep_wulin_3d(palette_3d):
-    pal = np.asarray(palette_3d, dtype=np.float32)  # (K,3)
-    len2s = np.sum(pal * pal, axis=1)
-    norms = np.sqrt(len2s)
-    order = np.argsort(norms)  # ascending
-    return pal[order], norms[order], len2s[order], order
+def init_centroids_from_palette_lab(palette_rgb):
+    return rgb_list_to_lab_array(palette_rgb).astype(np.float32)
 
-def wu_lin_nearest_color_3d(x0, x1, x2, pal_sorted, norms, len2s):
-    x_sq = x0*x0 + x1*x1 + x2*x2
-    x_norm = math.sqrt(x_sq)
-    Kp = pal_sorted.shape[0]
 
-    lo, hi = 0, Kp - 1
-    best_k = 0
-    best_diff = float("inf")
+def fast_kmeans_refine_lab_fast(sampled_rgb_u8, initial_palette_rgb, max_iter=10, chunk_size=120000):
+    if sampled_rgb_u8 is None or len(sampled_rgb_u8) == 0:
+        return initial_palette_rgb, [], None, None, None
 
-    while lo <= hi:
-        mid = (lo + hi) // 2
-        diff = norms[mid] - x_norm
-        ad = abs(diff)
-        if ad < best_diff:
-            best_diff = ad
-            best_k = mid
-        if diff < 0:
-            lo = mid + 1
-        elif diff > 0:
-            hi = mid - 1
-        else:
-            break
+    sampled_lab = rgb_list_to_lab_array(sampled_rgb_u8)
+    N = sampled_lab.shape[0]
 
-    def consider(idx, sed1_min, nearest_idx):
-        y = pal_sorted[idx]
-        len2 = float(len2s[idx])
-        dot_xy = x0*y[0] + x1*y[1] + x2*y[2]
-        sed1 = len2 - 2.0 * dot_xy
-        if sed1 < sed1_min:
-            return sed1, idx
-        return sed1_min, nearest_idx
-
-    sed1_min = float("inf")
-    nearest_idx = best_k
-    sed1_min, nearest_idx = consider(best_k, sed1_min, nearest_idx)
-
-    i = best_k - 1
-    while i >= 0:
-        y_norm = float(norms[i])
-        if y_norm * (y_norm - 2.0 * x_norm) >= sed1_min:
-            break
-        sed1_min, nearest_idx = consider(i, sed1_min, nearest_idx)
-        i -= 1
-
-    i = best_k + 1
-    while i < Kp:
-        y_norm = float(norms[i])
-        if y_norm * (y_norm - 2.0 * x_norm) >= sed1_min:
-            break
-        sed1_min, nearest_idx = consider(i, sed1_min, nearest_idx)
-        i += 1
-
-    return nearest_idx, (x_sq + sed1_min)
-
-# ============================================================
-# STAGE 2 — Fast K-Means in CIELAB (Assign -> Update Means -> MSE Stop)
-# (Returns palette_lab + cluster support counts for SOP3)
-# ============================================================
-def fast_kmeans_refine_lab(sampled_rgb, initial_palette_rgb, max_iter=10):
-    if not sampled_rgb:
-        return initial_palette_rgb, [], None, None
-
-    sampled_lab = rgb_list_to_lab_array(sampled_rgb)              # (N,3)
-    palette_lab = rgb_list_to_lab_array(initial_palette_rgb)      # (K,3)
+    centroids = init_centroids_from_palette_lab(initial_palette_rgb)
+    Kc = centroids.shape[0]
 
     mse_hist = []
     prev_mse = None
-
     last_counts = None
 
     for it in range(max_iter):
-        pal_sorted, norms, len2s, order = _prep_wulin_3d(palette_lab)
+        counts = np.zeros(Kc, dtype=np.int32)
+        sums = np.zeros((Kc, 3), dtype=np.float64)
+        mse_sum = 0.0
 
-        counts = np.zeros(K, dtype=np.int32)
-        sums = np.zeros((K, 3), dtype=np.float64)
-        mse_accum = 0.0
+        for start in range(0, N, chunk_size):
+            end = min(start + chunk_size, N)
+            chunk = sampled_lab[start:end]
 
-        for p in sampled_lab:
-            k_sorted, sed = wu_lin_nearest_color_3d(float(p[0]), float(p[1]), float(p[2]),
-                                                   pal_sorted, norms, len2s)
-            k = int(order[k_sorted])
-            counts[k] += 1
-            sums[k] += p
-            mse_accum += sed
+            diff = chunk[:, None, :] - centroids[None, :, :]
+            d2 = np.sum(diff * diff, axis=2)
+            labels = np.argmin(d2, axis=1)
+            min_d2 = d2[np.arange(len(chunk)), labels]
 
-        mse = mse_accum / float(len(sampled_lab))
+            mse_sum += float(np.sum(min_d2))
+
+            counts += np.bincount(labels, minlength=Kc).astype(np.int32)
+            for ch in range(3):
+                sums[:, ch] += np.bincount(labels, weights=chunk[:, ch], minlength=Kc)
+
+        mse = mse_sum / float(N)
         mse_hist.append(mse)
         print(f"[Stage2-Lab] Iter {it}: MSE_Lab = {mse:.2f}")
 
@@ -308,32 +246,29 @@ def fast_kmeans_refine_lab(sampled_rgb, initial_palette_rgb, max_iter=10):
             break
         prev_mse = mse
 
-        for k in range(K):
-            if counts[k] > 0:
-                palette_lab[k] = (sums[k] / counts[k]).astype(np.float32)
+        mask = counts > 0
+        centroids[mask] = (sums[mask] / counts[mask, None]).astype(np.float32)
 
-        lens = np.sum(palette_lab * palette_lab, axis=1)
-        palette_lab = palette_lab[np.argsort(lens)]
-
+        lens = np.sum(centroids * centroids, axis=1)
+        order = np.argsort(lens)
+        centroids = centroids[order]
+        counts = counts[order]
         last_counts = counts.copy()
 
-    final_palette_rgb = lab_array_to_rgb_list(palette_lab)
-    return final_palette_rgb, mse_hist, palette_lab, last_counts
+    final_palette_rgb = lab_array_to_rgb_list(centroids)
+    return final_palette_rgb, mse_hist, centroids, last_counts, sampled_lab
+
 
 # ============================================================
-# SOP3 — Perceptual Separation (ΔE76 in Lab), threshold = 4
+# SOP3 — ΔE de-dup + reseed
 # ============================================================
 def delta_e76_matrix(lab_arr):
-    """Pairwise ΔE76 (K,K) for palette lab (K,3)."""
     diff = lab_arr[:, None, :] - lab_arr[None, :, :]
     d2 = np.sum(diff * diff, axis=2)
     return np.sqrt(np.maximum(d2, 0.0))
 
+
 def pick_reseed_candidate(sampled_lab, palette_lab, max_candidates=2000):
-    """
-    Choose a new color from sampled_lab that maximizes its minimum ΔE to current palette.
-    Uses a subset of sampled points for speed.
-    """
     N = sampled_lab.shape[0]
     if N == 0:
         return palette_lab[0].copy()
@@ -344,7 +279,6 @@ def pick_reseed_candidate(sampled_lab, palette_lab, max_candidates=2000):
     else:
         cand = sampled_lab
 
-    # compute min ΔE to palette for each candidate
     diff = cand[:, None, :] - palette_lab[None, :, :]
     d2 = np.sum(diff * diff, axis=2)
     de = np.sqrt(np.maximum(d2, 0.0))
@@ -353,12 +287,8 @@ def pick_reseed_candidate(sampled_lab, palette_lab, max_candidates=2000):
     best = int(np.argmax(min_de))
     return cand[best].astype(np.float32)
 
+
 def enforce_perceptual_separation(sampled_lab, palette_lab, counts, thresh=4.0, passes=2, max_candidates=2000):
-    """
-    If any two palette colors are too close (ΔE < thresh),
-    keep the one with higher cluster support (counts),
-    reseed the weaker slot with a candidate that is far from the palette.
-    """
     pal = palette_lab.copy()
     cnt = counts.copy() if counts is not None else np.ones((pal.shape[0],), dtype=np.int32)
 
@@ -366,28 +296,20 @@ def enforce_perceptual_separation(sampled_lab, palette_lab, counts, thresh=4.0, 
         de = delta_e76_matrix(pal)
         np.fill_diagonal(de, np.inf)
 
-        # find closest pair
         i, j = np.unravel_index(np.argmin(de), de.shape)
         min_de = float(de[i, j])
-
         if min_de >= thresh:
             break
 
-        # choose keep/drop by cluster support
-        if cnt[i] >= cnt[j]:
-            keep, drop = i, j
-        else:
-            keep, drop = j, i
-
-        # reseed dropped slot
-        new_color = pick_reseed_candidate(sampled_lab, pal, max_candidates=max_candidates)
-        pal[drop] = new_color
-        cnt[drop] = 0  # unknown support after reseed (ok for repeated passes)
+        keep, drop = (i, j) if cnt[i] >= cnt[j] else (j, i)
+        pal[drop] = pick_reseed_candidate(sampled_lab, pal, max_candidates=max_candidates)
+        cnt[drop] = 0
 
     return pal
 
+
 # ============================================================
-# VISUALS — CIELAB sphere + swatch + fast quantized preview
+# VISUALS (CRISP + ACCURATE)
 # ============================================================
 def make_swatch_image(palette_rgb, swatch_h=70, w_per=50):
     img = Image.new("RGB", (w_per * len(palette_rgb), swatch_h))
@@ -398,33 +320,33 @@ def make_swatch_image(palette_rgb, swatch_h=70, w_per=50):
                 img.putpixel((x, y), c)
     return img
 
-def downscale_for_preview(img, max_side=256):
-    w, h = img.size
-    if max(w, h) <= max_side:
-        return img
-    scale = max_side / float(max(w, h))
-    nw, nh = int(round(w * scale)), int(round(h * scale))
-    try:
-        resample = Image.Resampling.BILINEAR
-    except AttributeError:
-        resample = Image.BILINEAR
-    return img.resize((nw, nh), resample)
 
-def quantize_preview_lab_fast(img, palette_rgb):
-    img_small = downscale_for_preview(img, QUANT_PREVIEW_MAX)
-    arr_rgb = np.asarray(img_small, dtype=np.float32) / 255.0
-    lab_img = rgb2lab(arr_rgb)  # (H,W,3)
+def quantize_lab_image_fullres(img, palette_rgb, chunk_size=120000):
+    """
+    Quantize at img resolution using Lab nearest centroid (chunked).
+    Returns PIL image same size as img.
+    """
+    arr_rgb = np.asarray(img, dtype=np.float32) / 255.0  # (H,W,3)
+    lab_img = rgb2lab(arr_rgb).astype(np.float32)
 
-    pal_lab = rgb_list_to_lab_array(palette_rgb).astype(np.float32)  # (K,3)
     H, W = lab_img.shape[:2]
-    lab_flat = lab_img.reshape(-1, 3).astype(np.float32)
+    lab_flat = lab_img.reshape(-1, 3)
 
-    d2 = np.sum((lab_flat[:, None, :] - pal_lab[None, :, :]) ** 2, axis=2)
-    idx = np.argmin(d2, axis=1)
-
+    pal_lab = rgb_list_to_lab_array(palette_rgb).astype(np.float32)
     pal_rgb = np.asarray(palette_rgb, dtype=np.uint8)
-    out = pal_rgb[idx].reshape(H, W, 3)
+
+    out_flat = np.empty((lab_flat.shape[0], 3), dtype=np.uint8)
+
+    for start in range(0, lab_flat.shape[0], chunk_size):
+        end = min(start + chunk_size, lab_flat.shape[0])
+        chunk = lab_flat[start:end]
+        d2 = np.sum((chunk[:, None, :] - pal_lab[None, :, :]) ** 2, axis=2)
+        idx = np.argmin(d2, axis=1)
+        out_flat[start:end] = pal_rgb[idx]
+
+    out = out_flat.reshape(H, W, 3)
     return Image.fromarray(out)
+
 
 def plot_lab_sphere(ax, pixels_rgb, title, max_points=5000):
     pts = np.asarray(pixels_rgb, dtype=np.uint8)
@@ -451,46 +373,43 @@ def plot_lab_sphere(ax, pixels_rgb, title, max_points=5000):
 
     ax.scatter(a, b, L, c=pts.astype(np.float32) / 255.0, s=2, alpha=0.6)
 
+
 # ============================================================
-# MAIN — follows your proposed architecture order
+# MAIN
 # ============================================================
 if __name__ == "__main__":
     random.seed(RANDOM_SEED)
     np.random.seed(RANDOM_SEED)
 
-    # Input Image (Stage 1 uses original)
+    t_total0 = time.perf_counter()
+
     orig = Image.open(IMAGE_PATH).convert("RGB")
-    ow, oh = orig.size
-    pixels_all = list(orig.getdata())
+    pixels_all = np.asarray(orig, dtype=np.uint8).reshape(-1, 3)
 
     # ---------- STAGE 1 ----------
-    initc, initn = build_rgb_cubes(orig, CUBE_BINS, COUNT_THRESHOLD)
+    t_s10 = time.perf_counter()
+    initc, initn = build_rgb_cubes_fast(orig, CUBE_BINS, COUNT_THRESHOLD)
     initialized_palette = initial_palette_generation(initc, initn, K=K)
+    t_s11 = time.perf_counter()
+    stage1_time = t_s11 - t_s10
 
     # ---------- STAGE 2 ----------
     proc_img, resized = resize_to_max(orig, PROCESS_MAX)
     pw, ph = proc_img.size
-
-    print("\nStage 2: Resize ≤512 (SOP2)")
-    print(f"Original: {ow}x{oh} -> Processed: {pw}x{ph} (cap={PROCESS_MAX})")
-
     sampled_pixels = block_sample_pixels(proc_img, SAMPLE_RATE)
 
-    print("Stage 2: RGB→CIELAB, Assign Nearest (Wu–Lin), Update Means, MSE Stop...")
-    t0 = time.perf_counter()
-    stage2_palette_rgb, mse_hist, stage2_palette_lab, stage2_counts = fast_kmeans_refine_lab(
-        sampled_pixels, initialized_palette, max_iter=MAX_ITER
+    print("\nStage 2: RGB→CIELAB, Assign Nearest, Update Means, MSE Stop... (FAST)")
+    t_s20 = time.perf_counter()
+    stage2_palette_rgb, mse_hist, stage2_palette_lab, stage2_counts, sampled_lab = fast_kmeans_refine_lab_fast(
+        sampled_pixels, initialized_palette, max_iter=MAX_ITER, chunk_size=CHUNK_SIZE
     )
-    t1 = time.perf_counter()
+    t_s21 = time.perf_counter()
+    stage2_time = t_s21 - t_s20
 
-    runtime = t1 - t0
     final_mse = mse_hist[-1] if mse_hist else 0.0
-    print(f"\nSTAGE2 DONE: Runtime={runtime:.2f}s | Final MSE_Lab={final_mse:.2f} | K={K}")
 
-    # ---------- STAGE 3 (SOP3) ----------
-    # Apply perceptual separation on the Stage2 palette (Lab), threshold ΔE=4
+    # ---------- STAGE 3 ----------
     if stage2_palette_lab is not None:
-        sampled_lab = rgb_list_to_lab_array(sampled_pixels)
         fixed_palette_lab = enforce_perceptual_separation(
             sampled_lab=sampled_lab,
             palette_lab=stage2_palette_lab,
@@ -504,34 +423,45 @@ if __name__ == "__main__":
     else:
         final_palette_rgb = stage2_palette_rgb
 
-    # ---------- VISUALS ----------
-    quant = quantize_preview_lab_fast(proc_img, final_palette_rgb)
+    t_total1 = time.perf_counter()
+    total_time = t_total1 - t_total0
+
+    print("\n====================")
+    print(f"ENH Total Runtime: {total_time:.4f}s")
+    print(f"Stage1 Runtime:    {stage1_time:.4f}s")
+    print(f"Stage2 Runtime:    {stage2_time:.4f}s")
+    print(f"Final MSE_Lab:     {final_mse:.2f}")
+    print("====================\n")
+
+    # ---------- VISUALS (ACCURATE + CRISP) ----------
+    quant = quantize_lab_image_fullres(proc_img, final_palette_rgb, chunk_size=CHUNK_SIZE)
     swatch = make_swatch_image(final_palette_rgb)
 
+    # ✅ KEEP FIGURE SIZE EXACTLY LIKE YOURS
     fig = plt.figure(figsize=(12, 8))
     gs = fig.add_gridspec(2, 2, height_ratios=[3, 2], hspace=0.35, wspace=0.25)
 
     fig.suptitle(
-        f"SOP1+SOP2+SOP3 Enhanced | Runtime={runtime:.2f}s | MSE_Lab={final_mse:.2f} | "
-        f"K={K} | Proc={pw}×{ph} | SampleRate={SAMPLE_RATE} | ΔE≥{DELTA_E_THRESH}",
-        fontsize=12
+        f"ENHANCED SOP1+SOP2+SOP3 | Total={total_time:.4f}s | Stage1={stage1_time:.4f}s | Stage2={stage2_time:.4f}s\n"
+        f"MSE_Lab={final_mse:.2f} | K={K} | Proc={pw}×{ph} | SampleRate={SAMPLE_RATE} | ΔE≥{DELTA_E_THRESH}",
+        fontsize=12, fontweight="bold"
     )
 
     ax1 = fig.add_subplot(gs[0, 0])
-    ax1.imshow(orig)
+    ax1.imshow(orig, interpolation="nearest")
     ax1.set_title("Original image (input)")
     ax1.axis("off")
 
     ax2 = fig.add_subplot(gs[0, 1])
-    ax2.imshow(quant)
-    ax2.set_title("Quantized Preview (Final palette)")
+    ax2.imshow(quant, interpolation="nearest")
+    ax2.set_title("Quantized Output")
     ax2.axis("off")
 
     ax3 = fig.add_subplot(gs[1, 0], projection="3d")
     plot_lab_sphere(ax3, pixels_all, "CIELAB Sphere (a*, b*, L*)", max_points=SPHERE_POINTS)
 
     ax4 = fig.add_subplot(gs[1, 1])
-    ax4.imshow(np.asarray(swatch, dtype=np.uint8))
+    ax4.imshow(np.asarray(swatch, dtype=np.uint8), interpolation="nearest")
     ax4.set_title("Final palette swatch (RGB view)")
     ax4.axis("off")
 

@@ -12,7 +12,7 @@ from skimage.color import rgb2lab, lab2rgb
 import random
 
 # ---------------- PARAMETERS ----------------
-IMAGE_PATH = "flower.jpg"
+IMAGE_PATH = "4.2.05.tiff"
 K = 8
 MAX_ITER = 10
 SEED = 1
